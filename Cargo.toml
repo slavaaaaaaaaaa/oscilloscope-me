@@ -1,0 +1,22 @@
+[package]
+name = "oscilloscope-me"
+version = "0.1.0"
+edition = "2021"
+description = "FM SDR receiver with terminal X/Y vectorscope for oscilloscope music"
+license = "GPL-3.0-or-later"
+readme = "README.md"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+cpal = "0.15"
+crossbeam-channel = "0.5"
+crossterm = "0.28"
+num-complex = "0.4"
+ratatui = "0.29"
+rtl-sdr-rs = "0.3"
+rubato = "0.16"
+ctrlc = "3.4"
+
+[profile.release]
+lto = true
+codegen-units = 1
