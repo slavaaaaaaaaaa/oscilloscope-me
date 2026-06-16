@@ -1,7 +1,10 @@
 //! cpal stereo audio output.
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{BufferSize, FromSample, Sample, SampleFormat, Stream, StreamConfig, SupportedBufferSize};
+use cpal::{
+    BufferSize, FromSample, Sample, SampleFormat, Stream, StreamConfig, SupportedBufferSize,
+    SupportedStreamConfigRange,
+};
 use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
 
 use crate::sdr::SharedRing;
@@ -51,6 +54,31 @@ fn pick_sample_rate(device: &cpal::Device, target: u32) -> Result<u32, String> {
         .default_output_config()
         .map(|c| c.sample_rate().0)
         .map_err(|e| e.to_string())
+}
+
+/// Lower rank = preferred format when multiple configs match the same rate.
+fn format_rank(fmt: SampleFormat) -> Option<u8> {
+    match fmt {
+        SampleFormat::F32 => Some(0),
+        SampleFormat::I16 => Some(1),
+        SampleFormat::U16 => Some(2),
+        SampleFormat::I32 => Some(3),
+        SampleFormat::F64 => Some(4),
+        SampleFormat::I8 => Some(5),
+        SampleFormat::U8 => Some(6),
+        _ => None,
+    }
+}
+
+fn pick_output_config(device: &cpal::Device, rate: u32) -> Result<SupportedStreamConfigRange, String> {
+    device
+        .supported_output_configs()
+        .map_err(|e| e.to_string())?
+        .filter(|c| rate >= c.min_sample_rate().0 && rate <= c.max_sample_rate().0)
+        .filter_map(|c| format_rank(c.sample_format()).map(|rank| (rank, c)))
+        .min_by_key(|(rank, _)| *rank)
+        .map(|(_, cfg)| cfg)
+        .ok_or_else(|| "No supported config for chosen sample rate".to_string())
 }
 
 struct ResamplerState {
@@ -169,14 +197,8 @@ pub fn start_audio(
         );
     }
 
-    let stream_config_range = device
-        .supported_output_configs()
-        .map_err(|e| e.to_string())?
-        .find(|c| {
-            negotiated >= c.min_sample_rate().0 && negotiated <= c.max_sample_rate().0
-        })
-        .ok_or_else(|| "No supported config for chosen sample rate".to_string())?
-        .with_sample_rate(cpal::SampleRate(negotiated));
+    let stream_config_range =
+        pick_output_config(&device, negotiated)?.with_sample_rate(cpal::SampleRate(negotiated));
 
     let sample_format = stream_config_range.sample_format();
     let mut stream_config: StreamConfig = stream_config_range.config();
@@ -192,12 +214,20 @@ pub fn start_audio(
         SampleFormat::F32 => build_stream::<f32>(&device, &stream_config, ring_cb, channels)?,
         SampleFormat::I16 => build_stream::<i16>(&device, &stream_config, ring_cb, channels)?,
         SampleFormat::U16 => build_stream::<u16>(&device, &stream_config, ring_cb, channels)?,
-        other => return Err(format!("Unsupported sample format: {other:?}")),
+        SampleFormat::I32 => build_stream::<i32>(&device, &stream_config, ring_cb, channels)?,
+        SampleFormat::F64 => build_stream::<f64>(&device, &stream_config, ring_cb, channels)?,
+        SampleFormat::I8 => build_stream::<i8>(&device, &stream_config, ring_cb, channels)?,
+        SampleFormat::U8 => build_stream::<u8>(&device, &stream_config, ring_cb, channels)?,
+        other => {
+            return Err(format!(
+                "Unsupported sample format: {other:?}. Try -a <device>."
+            ))
+        }
     };
 
     stream.play().map_err(|e| e.to_string())?;
 
-    eprintln!("Audio output: {device_name} @ {negotiated} Hz");
+    eprintln!("Audio output: {device_name} @ {negotiated} Hz ({sample_format:?})");
 
     Ok(AudioOutput {
         _stream: stream,

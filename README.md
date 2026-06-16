@@ -30,10 +30,10 @@ cargo build --release
 
 ```bash
 # Debian/Ubuntu
-sudo apt install libusb-1.0-0-dev pkg-config
+sudo apt install libusb-1.0-0-dev pkg-config libasound2-dev cargo
 
 # Fedora
-sudo dnf install libusb1-devel pkg-config
+sudo dnf install libusb1-devel pkg-config libasound2-dev cargo
 
 cargo build --release
 ```
