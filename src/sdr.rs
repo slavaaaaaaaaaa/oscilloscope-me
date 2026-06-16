@@ -45,17 +45,25 @@ impl SdrHandle {
     }
 }
 
-pub fn device_count() -> usize {
-    RtlSdr::get_device_count().unwrap_or(0)
+/// Probe whether an RTL-SDR can be opened. `get_device_count()` / `open_first_available()`
+/// also open each device just to read USB strings, which can leave the dongle busy on Linux.
+fn probe_device() -> bool {
+    match RtlSdr::open_with_index(0) {
+        Ok(mut sdr) => {
+            let _ = sdr.close();
+            thread::sleep(Duration::from_millis(200));
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 pub fn wait_for_device() -> Result<(), String> {
     let frames = ['|', '/', '-', '\\'];
     let mut i = 0usize;
     loop {
-        let count = device_count();
-        if count > 0 {
-            eprintln!("\rSDR detected ({count} device(s)).          ");
+        if probe_device() {
+            eprintln!("\rSDR detected.          ");
             return Ok(());
         }
         eprint!("\rWaiting for SDR... {}  ", frames[i % frames.len()]);
@@ -68,8 +76,12 @@ fn format_sdr_error(e: &rtl_sdr_rs::error::RtlsdrError) -> String {
     let msg = format!("{e}");
     if msg.contains("Busy") || msg.contains("busy") {
         format!(
-            "{msg}\n\nLinux: kernel DVB driver may be claiming the dongle.\n\
-             Try: sudo rmmod rtl2832_sdr dvb_usb_rtl28xxu rtl2832 rtl8xxxu\n\
+            "{msg}\n\n\
+             Another process may still have the dongle open (e.g. a previous run):\n\
+               pkill -f oscilloscope-me\n\
+             Unplug/replug the dongle, then try again.\n\n\
+             Linux: kernel DVB driver may also be claiming it:\n\
+               sudo rmmod rtl2832_sdr dvb_usb_rtl28xxu rtl2832 rtl8xxxu\n\
              Or add a udev rule (see README)."
         )
     } else {
@@ -137,11 +149,16 @@ fn capture_loop(
             break;
         }
 
-        let mut sdr = match RtlSdr::open_first_available() {
+        let mut sdr = match RtlSdr::open_with_index(0) {
             Ok(s) => s,
             Err(e) => {
+                let busy = format!("{e}").to_ascii_lowercase().contains("busy");
                 let _ = event_tx.send(AppEvent::SdrDisconnected(format_sdr_error(&e)));
-                thread::sleep(Duration::from_secs(1));
+                thread::sleep(if busy {
+                    Duration::from_secs(2)
+                } else {
+                    Duration::from_secs(1)
+                });
                 continue;
             }
         };
@@ -248,10 +265,10 @@ fn capture_loop(
         }
 
         let _ = sdr.close();
+        thread::sleep(Duration::from_millis(300));
         if stop.load(Ordering::Relaxed) || app_shutdown.load(Ordering::Relaxed) {
             break;
         }
-        thread::sleep(Duration::from_millis(500));
     }
 }
 
