@@ -52,9 +52,10 @@ If you see `Usb(Busy)`, the kernel DVB driver may be claiming the dongle:
 
 ```bash
 sudo rmmod rtl2832_sdr dvb_usb_rtl28xxu rtl2832 rtl8xxxu
-```
 
-For a permanent fix, blacklist those modules (see [rtl-sdr-rs Linux notes](https://github.com/ccostes/rtl-sdr-rs#linux-kernel-modules)).
+# For a permanent fix, blacklist those modules:
+sudo cp blacklist-rtlsdr.conf /etc/modprobe.d/blacklist-rtlsdr.conf
+```
 
 ## Usage
 
