@@ -2,9 +2,7 @@
 
 FM SDR receiver with a terminal **X/Y vectorscope** for [oscilloscope music](https://oscilloscopemusic.com/). Tune an FM station (e.g. ToorCamp's LOL radio), preview Lissajous shapes in the terminal, and output stereo L/R audio for an analog oscilloscope in XY mode.
 
-Try it with [Oscilloscope Music](https://oscilloscopemusic.bandcamp.com/album/oscilloscope-music).
-
-**Left = X, Right = Y**
+![Terminal vectorscope](screenshot.png)
 
 ## Hardware
 
