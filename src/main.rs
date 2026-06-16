@@ -127,8 +127,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?)
     };
 
-    let file_handle = if let Some(path) = cli.file {
-        let track = file::decode_mp3(&path)?;
+    let mut decoded_track = None;
+    let file_path = cli.file.clone();
+    if let Some(path) = &file_path {
+        let track = file::decode_mp3(path)?;
         eprintln!(
             "Loaded {} — {:.1}s @ {} Hz{}",
             path.display(),
@@ -138,10 +140,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         if track.sample_rate != audio.sample_rate {
             eprintln!(
-                "File resampled: {} Hz -> {} Hz for playback",
+                "Will resample: {} Hz -> {} Hz during playback",
                 track.sample_rate, audio.sample_rate
             );
         }
+        decoded_track = Some(track);
+    }
+
+    let shutdown_sig = shutdown.handle();
+    ctrlc_handler(shutdown_sig);
+
+    let mut terminal = setup_terminal()?;
+    if file_mode {
+        state.status_message = "Preparing playback…".into();
+    }
+
+    let file_handle = if let (Some(path), Some(track)) = (file_path, decoded_track) {
         Some(file::start_playback(
             path,
             track,
@@ -155,10 +169,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    let shutdown_sig = shutdown.handle();
-    ctrlc_handler(shutdown_sig);
-
-    let mut terminal = setup_terminal()?;
     let tick_rate = Duration::from_millis(TICK_MS);
     let mut last_tick = Instant::now();
     let mut display_buf: Vec<StereoSample> = Vec::with_capacity(display::TRACE_CAPACITY);

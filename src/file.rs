@@ -149,21 +149,20 @@ pub fn start_playback(
     event_tx: crossbeam_channel::Sender<AppEvent>,
     app_shutdown: Arc<AtomicBool>,
 ) -> Result<FileHandle, String> {
-    let mut resampler = StereoResampler::new(track.sample_rate, device_rate);
-    let (left, right) = resampler.process(&track.left, &track.right);
-
     let stop = Arc::new(AtomicBool::new(false));
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
     let stop_thread = stop.clone();
     let app_shutdown_thread = app_shutdown.clone();
     let path_display = path.clone();
+    let source_rate = track.sample_rate;
 
     let thread = thread::Builder::new()
         .name("file-playback".into())
         .spawn(move || {
             playback_loop(
-                left,
-                right,
+                track.left,
+                track.right,
+                source_rate,
                 device_rate,
                 loop_playback,
                 ring,
@@ -186,7 +185,8 @@ pub fn start_playback(
 fn playback_loop(
     left: Vec<f32>,
     right: Vec<f32>,
-    sample_rate: u32,
+    source_rate: u32,
+    device_rate: u32,
     mut loop_playback: bool,
     ring: SharedRing,
     event_tx: crossbeam_channel::Sender<AppEvent>,
@@ -195,9 +195,11 @@ fn playback_loop(
     app_shutdown: Arc<AtomicBool>,
     path: PathBuf,
 ) {
+    let mut resampler = StereoResampler::new(source_rate, device_rate);
+
     let _ = event_tx.send(AppEvent::FilePlaying {
         path: path.display().to_string(),
-        sample_rate,
+        sample_rate: device_rate,
         loop_playback,
     });
 
@@ -214,11 +216,13 @@ fn playback_loop(
         let end = (pos + CHUNK_FRAMES).min(total);
         let chunk_l = &left[pos..end];
         let chunk_r = &right[pos..end];
-        let frames = chunk_l.len();
+        let input_frames = chunk_l.len();
 
-        {
+        let (audio_l, audio_r) = resampler.process(chunk_l, chunk_r);
+
+        if !audio_l.is_empty() {
             let mut r = ring.lock().unwrap();
-            r.push_frame(chunk_l, chunk_r);
+            r.push_frame(&audio_l, &audio_r);
         }
 
         let (scope_l, scope_r) = decimate_scope_pair(chunk_l, chunk_r, 192);
@@ -230,7 +234,7 @@ fn playback_loop(
         });
 
         let chunk_duration =
-            Duration::from_secs_f64(frames as f64 / sample_rate as f64);
+            Duration::from_secs_f64(input_frames as f64 / source_rate as f64);
         let deadline = Instant::now() + chunk_duration;
         while Instant::now() < deadline {
             if stop.load(Ordering::Relaxed) || app_shutdown.load(Ordering::Relaxed) {
@@ -246,8 +250,15 @@ fn playback_loop(
 
         pos = end;
         if pos >= total {
+            let (tail_l, tail_r) = resampler.flush();
+            if !tail_l.is_empty() {
+                let mut r = ring.lock().unwrap();
+                r.push_frame(&tail_l, &tail_r);
+            }
+
             if loop_playback {
                 pos = 0;
+                resampler.reset(source_rate, device_rate);
                 if let Ok(mut r) = ring.lock() {
                     r.clear();
                 }

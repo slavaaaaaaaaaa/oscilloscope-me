@@ -88,6 +88,14 @@ cargo run --release -- --file path/to/oscilloscope-music.mp3
 
 Playback **loops** by default. Press `l` in the app to toggle loop, or pass `--no-loop` to play once.
 
+For 44.1 kHz source files, matching the output rate avoids resampling and speeds startup:
+
+```bash
+cargo run --release -- --file path/to/oscilloscope-music.mp3 -r 44100
+```
+
+On Linux/WSL you may see harmless ALSA `dmix`/`dsnoop` errors during device enumeration; audio still works if `Audio output: …` is printed.
+
 ### Options
 
 ```

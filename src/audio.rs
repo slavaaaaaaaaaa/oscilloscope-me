@@ -81,9 +81,12 @@ fn pick_output_config(device: &cpal::Device, rate: u32) -> Result<SupportedStrea
         .ok_or_else(|| "No supported config for chosen sample rate".to_string())
 }
 
+const INPUT_BUF_COMPACT_THRESHOLD: usize = 8192;
+
 struct ResamplerState {
     resampler: SincFixedIn<f32>,
     input_buf: Vec<f32>,
+    read_pos: usize,
     channels: usize,
 }
 
@@ -107,13 +110,55 @@ impl ResamplerState {
         Self {
             resampler,
             input_buf: Vec::new(),
+            read_pos: 0,
             channels: 2,
+        }
+    }
+
+    fn available_frames(&self) -> usize {
+        (self.input_buf.len().saturating_sub(self.read_pos)) / self.channels
+    }
+
+    fn compact_if_needed(&mut self) {
+        if self.read_pos >= INPUT_BUF_COMPACT_THRESHOLD {
+            self.input_buf.drain(..self.read_pos);
+            self.read_pos = 0;
+        }
+    }
+
+    fn deinterleave_chunk(&self, chunk: usize) -> Vec<Vec<f32>> {
+        let base = self.read_pos;
+        (0..self.channels)
+            .map(|ch| {
+                (0..chunk)
+                    .map(|i| self.input_buf[base + i * self.channels + ch])
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn process_available(&mut self, out_l: &mut Vec<f32>, out_r: &mut Vec<f32>) {
+        loop {
+            let chunk = self.resampler.input_frames_next();
+            if self.available_frames() < chunk {
+                break;
+            }
+
+            let input = self.deinterleave_chunk(chunk);
+            self.read_pos += chunk * self.channels;
+
+            if let Ok(out) = self.resampler.process(&input, None) {
+                out_l.extend_from_slice(&out[0]);
+                out_r.extend_from_slice(&out[1]);
+            }
+
+            self.compact_if_needed();
         }
     }
 
     fn feed(&mut self, left: &[f32], right: &[f32]) -> (Vec<f32>, Vec<f32>) {
         let len = left.len().min(right.len());
-        self.input_buf.reserve(len * 2);
+        self.input_buf.reserve(len * self.channels);
         for i in 0..len {
             self.input_buf.push(left[i]);
             self.input_buf.push(right[i]);
@@ -121,34 +166,40 @@ impl ResamplerState {
 
         let mut out_l = Vec::new();
         let mut out_r = Vec::new();
+        self.process_available(&mut out_l, &mut out_r);
+        (out_l, out_r)
+    }
+
+    /// Drain any buffered input, zero-padding the final partial chunk.
+    fn flush(&mut self) -> (Vec<f32>, Vec<f32>) {
+        let mut out_l = Vec::new();
+        let mut out_r = Vec::new();
 
         loop {
             let chunk = self.resampler.input_frames_next();
-            let needed = chunk * self.channels;
-            if self.input_buf.len() < needed {
+            let available = self.available_frames();
+            if available == 0 {
                 break;
             }
+            if available < chunk {
+                let pad_frames = chunk - available;
+                self.input_buf
+                    .extend(std::iter::repeat_n(0.0f32, pad_frames * self.channels));
+            }
 
-            let input: Vec<Vec<f32>> = (0..self.channels)
-                .map(|ch| {
-                    self.input_buf
-                        .iter()
-                        .skip(ch)
-                        .step_by(self.channels)
-                        .take(chunk)
-                        .copied()
-                        .collect()
-                })
-                .collect();
-
-            self.input_buf.drain(..needed);
+            let input = self.deinterleave_chunk(chunk);
+            self.read_pos += chunk * self.channels;
 
             if let Ok(out) = self.resampler.process(&input, None) {
                 out_l.extend_from_slice(&out[0]);
                 out_r.extend_from_slice(&out[1]);
             }
+
+            self.compact_if_needed();
         }
 
+        self.input_buf.clear();
+        self.read_pos = 0;
         (out_l, out_r)
     }
 }
@@ -177,6 +228,14 @@ impl StereoResampler {
         match self.inner.as_mut() {
             Some(r) => r.feed(left, right),
             None => (left.to_vec(), right.to_vec()),
+        }
+    }
+
+    /// Flush resampler delay / partial input (call at end of a stream).
+    pub fn flush(&mut self) -> (Vec<f32>, Vec<f32>) {
+        match self.inner.as_mut() {
+            Some(r) => r.flush(),
+            None => (Vec::new(), Vec::new()),
         }
     }
 }
@@ -306,4 +365,40 @@ where
             None,
         )
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod resampler_tests {
+    use super::StereoResampler;
+    use std::time::Instant;
+
+    #[test]
+    fn resample_large_buffer_completes_quickly() {
+        let input_rate = 44_100;
+        let output_rate = 48_000;
+        let frames = 500_000usize;
+        let left: Vec<f32> = (0..frames).map(|i| (i as f32 * 0.001).sin()).collect();
+        let right: Vec<f32> = (0..frames).map(|i| (i as f32 * 0.002).cos()).collect();
+
+        let mut resampler = StereoResampler::new(input_rate, output_rate);
+        let start = Instant::now();
+        let (out_l, out_r) = resampler.process(&left, &right);
+        let (tail_l, tail_r) = resampler.flush();
+        let elapsed = start.elapsed();
+
+        assert!(!out_l.is_empty());
+        assert_eq!(out_l.len(), out_r.len());
+        assert_eq!(tail_l.len(), tail_r.len());
+        let total_out = out_l.len() + tail_l.len();
+        let expected = (frames as f64 * output_rate as f64 / input_rate as f64).round() as usize;
+        assert!(
+            total_out.abs_diff(expected) < 2048,
+            "expected ~{expected} output frames, got {total_out}"
+        );
+        assert!(
+            elapsed.as_secs() < 5,
+            "resampling 500k frames took {:?} (regression: O(n²) hang)",
+            elapsed
+        );
+    }
 }
