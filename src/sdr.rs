@@ -1,21 +1,38 @@
 //! RTL-SDR device discovery, wait loop, and IQ capture thread.
 
 use crate::app::AppEvent;
-use crate::demod::{configure_sdr, optimal_settings, DemodPipeline, MPX_SAMPLE_RATE, RadioConfig};
+use crate::audio::StereoResampler;
+use crate::demod::{
+    configure_sdr, optimal_settings, DemodPipeline, AUDIO_SAMPLE_RATE, MPX_SAMPLE_RATE,
+};
 use rtl_sdr_rs::{RtlSdr, DEFAULT_BUF_LENGTH};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+enum SdrCommand {
+    SetFreq(u32),
+    SetGain(i32),
+}
+
 pub struct SdrHandle {
-    shutdown: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    cmd_tx: crossbeam_channel::Sender<SdrCommand>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
 impl SdrHandle {
+    pub fn set_freq(&self, freq_hz: u32) {
+        let _ = self.cmd_tx.send(SdrCommand::SetFreq(freq_hz));
+    }
+
+    pub fn set_gain(&self, gain_db: i32) {
+        let _ = self.cmd_tx.send(SdrCommand::SetGain(gain_db));
+    }
+
     pub fn stop(mut self) {
-        self.shutdown.store(true, Ordering::Relaxed);
+        self.stop.store(true, Ordering::Relaxed);
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
@@ -58,18 +75,37 @@ pub fn start_capture(
     freq_hz: u32,
     ppm: i32,
     gain_db: i32,
+    mono_only: bool,
+    device_rate: u32,
+    ring: SharedRing,
     event_tx: crossbeam_channel::Sender<AppEvent>,
-    shutdown: Arc<AtomicBool>,
+    app_shutdown: Arc<AtomicBool>,
 ) -> Result<SdrHandle, String> {
-    let radio = optimal_settings(freq_hz, MPX_SAMPLE_RATE);
-    let shutdown_thread = shutdown.clone();
+    let stop = Arc::new(AtomicBool::new(false));
+    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    let stop_thread = stop.clone();
+    let app_shutdown_thread = app_shutdown.clone();
     let thread = thread::Builder::new()
         .name("sdr-capture".into())
-        .spawn(move || capture_loop(freq_hz, ppm, gain_db, radio, event_tx, shutdown_thread))
+        .spawn(move || {
+            capture_loop(
+                freq_hz,
+                ppm,
+                gain_db,
+                mono_only,
+                device_rate,
+                ring,
+                event_tx,
+                cmd_rx,
+                stop_thread,
+                app_shutdown_thread,
+            )
+        })
         .map_err(|e| e.to_string())?;
 
     Ok(SdrHandle {
-        shutdown: shutdown.clone(),
+        stop,
+        cmd_tx,
         thread: Some(thread),
     })
 }
@@ -78,12 +114,25 @@ fn capture_loop(
     freq_hz: u32,
     ppm: i32,
     gain_db: i32,
-    radio: RadioConfig,
+    mono_only: bool,
+    device_rate: u32,
+    ring: SharedRing,
     event_tx: crossbeam_channel::Sender<AppEvent>,
-    shutdown: Arc<AtomicBool>,
+    cmd_rx: crossbeam_channel::Receiver<SdrCommand>,
+    stop: Arc<AtomicBool>,
+    app_shutdown: Arc<AtomicBool>,
 ) {
+    let demod_rate = if mono_only {
+        AUDIO_SAMPLE_RATE
+    } else {
+        MPX_SAMPLE_RATE
+    };
+    let mut resampler = StereoResampler::new(demod_rate, device_rate);
+    let mut freq_hz = freq_hz;
+    let mut gain_db = gain_db;
+
     loop {
-        if shutdown.load(Ordering::Relaxed) {
+        if stop.load(Ordering::Relaxed) || app_shutdown.load(Ordering::Relaxed) {
             break;
         }
 
@@ -100,6 +149,7 @@ fn capture_loop(
             let _ = sdr.set_freq_correction(ppm);
         }
 
+        let (radio, mut demod_config) = optimal_settings(freq_hz, MPX_SAMPLE_RATE);
         if let Err(e) = configure_sdr(&mut sdr, &radio, gain_db) {
             let _ = event_tx.send(AppEvent::SdrDisconnected(format_sdr_error(&e)));
             thread::sleep(Duration::from_secs(1));
@@ -108,25 +158,65 @@ fn capture_loop(
 
         let _ = event_tx.send(AppEvent::SdrConnected {
             freq_hz,
-            sample_rate: radio.capture_rate,
+            gain_tenths: gain_db,
         });
 
-        let mut demod = DemodPipeline::new(radio.downsample);
+        let mut demod = DemodPipeline::new(demod_config, mono_only);
         let mut buf = vec![0u8; DEFAULT_BUF_LENGTH];
 
-        while !shutdown.load(Ordering::Relaxed) {
+        while !stop.load(Ordering::Relaxed) && !app_shutdown.load(Ordering::Relaxed) {
+            while let Ok(cmd) = cmd_rx.try_recv() {
+                match cmd {
+                    SdrCommand::SetFreq(new_freq) => {
+                        freq_hz = new_freq;
+                        let (radio, fresh) = optimal_settings(freq_hz, MPX_SAMPLE_RATE);
+                        demod_config = fresh;
+                        if sdr.set_center_freq(radio.capture_freq).is_ok() {
+                            let _ = sdr.reset_buffer();
+                            demod = DemodPipeline::new(demod_config, mono_only);
+                            if let Ok(mut r) = ring.lock() {
+                                r.clear();
+                            }
+                            let _ = event_tx.send(AppEvent::SdrConnected {
+                                freq_hz,
+                                gain_tenths: gain_db,
+                            });
+                        }
+                    }
+                    SdrCommand::SetGain(new_gain) => {
+                        gain_db = new_gain;
+                        let (radio, fresh) = optimal_settings(freq_hz, MPX_SAMPLE_RATE);
+                        demod_config = fresh;
+                        if configure_sdr(&mut sdr, &radio, gain_db).is_ok() {
+                            demod = DemodPipeline::new(demod_config, mono_only);
+                            if let Ok(mut r) = ring.lock() {
+                                r.clear();
+                            }
+                            let _ = event_tx.send(AppEvent::SdrConnected {
+                                freq_hz,
+                                gain_tenths: gain_db,
+                            });
+                        }
+                    }
+                }
+            }
+
             match sdr.read_sync(&mut buf) {
                 Ok(n) if n >= DEFAULT_BUF_LENGTH => {
                     let frame = demod.process_iq(&buf);
-                    let (left, right) = normalize_stereo(&frame.left, &frame.right);
-                    let peak_l = crate::demod::peak_dbfs(&left);
-                    let peak_r = crate::demod::peak_dbfs(&right);
+
+                    let (audio_l, audio_r) = resampler.process(&frame.left, &frame.right);
+                    {
+                        let mut r = ring.lock().unwrap();
+                        r.push_frame(&audio_l, &audio_r);
+                    }
+
                     let _ = event_tx.send(AppEvent::StereoData {
-                        left,
-                        right,
+                        left: frame.left,
+                        right: frame.right,
                         is_stereo: frame.is_stereo,
-                        peak_l,
-                        peak_r,
+                        peak_l: frame.peak_l,
+                        peak_r: frame.peak_r,
                     });
                 }
                 Ok(_) => {
@@ -143,14 +233,13 @@ fn capture_loop(
         }
 
         let _ = sdr.close();
-        if shutdown.load(Ordering::Relaxed) {
+        if stop.load(Ordering::Relaxed) || app_shutdown.load(Ordering::Relaxed) {
             break;
         }
         thread::sleep(Duration::from_millis(500));
     }
 }
 
-/// Ring buffer for audio output and display sampling.
 pub struct SampleRing {
     left: Vec<f32>,
     right: Vec<f32>,
@@ -166,10 +255,16 @@ impl SampleRing {
         }
     }
 
+    pub fn clear(&mut self) {
+        self.left.clear();
+        self.right.clear();
+        self.read_pos = 0;
+    }
+
     pub fn push_frame(&mut self, left: &[f32], right: &[f32]) {
         self.left.extend_from_slice(left);
         self.right.extend_from_slice(right);
-        const MAX: usize = MPX_SAMPLE_RATE as usize * 2;
+        const MAX: usize = 192_000;
         if self.left.len() > MAX {
             let drop = self.left.len() - MAX;
             self.left.drain(..drop);
@@ -178,7 +273,8 @@ impl SampleRing {
         }
     }
 
-    pub fn read_interleaved(&mut self, out: &mut [f32]) -> usize {
+    pub fn read_interleaved(&mut self, out: &mut [f32]) {
+        out.fill(0.0);
         let available = self.left.len().saturating_sub(self.read_pos);
         let frames = available.min(out.len() / 2);
         for i in 0..frames {
@@ -191,7 +287,6 @@ impl SampleRing {
             self.right.drain(..self.read_pos);
             self.read_pos = 0;
         }
-        frames * 2
     }
 }
 
@@ -199,16 +294,4 @@ pub type SharedRing = Arc<Mutex<SampleRing>>;
 
 pub fn new_shared_ring() -> SharedRing {
     Arc::new(Mutex::new(SampleRing::new()))
-}
-
-fn normalize_stereo(left: &[f32], right: &[f32]) -> (Vec<f32>, Vec<f32>) {
-    let peak = left
-        .iter()
-        .chain(right.iter())
-        .map(|s| s.abs())
-        .fold(0.0f32, f32::max);
-    let scale = if peak > 1e-6 { 0.85 / peak } else { 1.0 };
-    let l = left.iter().map(|s| s * scale).collect();
-    let r = right.iter().map(|s| s * scale).collect();
-    (l, r)
 }

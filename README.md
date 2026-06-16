@@ -62,8 +62,20 @@ For a permanent fix, blacklist those modules (see [rtl-sdr-rs Linux notes](https
 cargo run --release
 ```
 
+**If you hear static**, try the proven mono demod path first (same algorithm as `rtl_fm`):
+
+```bash
+cargo run --release -- --mono -f 94.1 -r 48000
+```
+
+Stereo / scope mode (higher sample rate for X/Y output):
+
+```bash
+cargo run --release -- -f 94.1 -r 192000
+```
+
 1. Plug in the SDR — the app waits until one is detected
-2. Enter FM frequency in MHz (default **88.5**)
+2. Tunes **94.1 MHz** by default (override with `-f`)
 3. Terminal shows a live X/Y vectorscope; audio plays on the default output device
 
 ### Options
@@ -73,6 +85,7 @@ oscilloscope-me [OPTIONS]
 
   -f, --freq <MHZ>           FM frequency in MHz
   -g, --gain <DB|auto>       Tuner gain (default: auto)
+      --mono                 Force mono decode (skip stereo PLL)
   -a, --audio-device <NAME>  Output device name substring
   -r, --sample-rate <HZ>     Target output rate (default: 192000)
       --ppm <PPM>            Frequency correction (default: 0)
@@ -94,7 +107,7 @@ RTL-SDR IQ → FM quadrature demod → stereo MPX decode (19 kHz pilot)
           → de-emphasis → L/R audio (cpal) + terminal vectorscope
 ```
 
-Internal MPX processing runs at **228 kHz**; audio is resampled to the best rate your output device supports (192 kHz preferred).
+Internal MPX processing runs at **192 kHz**; audio is resampled to the best rate your output device supports (192 kHz preferred).
 
 ## License
 

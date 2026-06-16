@@ -5,6 +5,8 @@ use super::fm::MPX_SAMPLE_RATE;
 
 const PILOT_HZ: f64 = 19_000.0;
 const CARRIER_HZ: f64 = 38_000.0;
+const PILOT_LOCK_THRESHOLD: f64 = 1e-5;
+const PILOT_LOCK_SAMPLES: u32 = 2_000;
 
 pub struct StereoDecoder {
     sample_rate: f64,
@@ -17,8 +19,9 @@ pub struct StereoDecoder {
     pll_phase: f64,
     pll_freq: f64,
     pll_alpha: f64,
-    stereo: bool,
     pilot_energy: f64,
+    pilot_lock_count: u32,
+    stereo: bool,
 }
 
 impl StereoDecoder {
@@ -27,16 +30,17 @@ impl StereoDecoder {
         Self {
             sample_rate,
             mono_lpf: Biquad::lowpass(sample_rate, 15_000.0, 0.707),
-            pilot_bpf: Biquad::bandpass(sample_rate, PILOT_HZ, 15.0),
+            pilot_bpf: Biquad::bandpass(sample_rate, PILOT_HZ, 20.0),
             carrier_bpf: Biquad::bandpass(sample_rate, CARRIER_HZ, 10.0),
             stereo_lpf: Biquad::lowpass(sample_rate, 15_000.0, 0.707),
             deemph_l: Deemphasis::us_broadcast(sample_rate),
             deemph_r: Deemphasis::us_broadcast(sample_rate),
             pll_phase: 0.0,
             pll_freq: 2.0 * std::f64::consts::PI * PILOT_HZ / sample_rate,
-            pll_alpha: 0.01,
-            stereo: false,
+            pll_alpha: 0.05,
             pilot_energy: 0.0,
+            pilot_lock_count: 0,
+            stereo: false,
         }
     }
 
@@ -54,26 +58,25 @@ impl StereoDecoder {
             let pilot = self.pilot_bpf.process(x);
 
             self.pilot_energy = 0.999 * self.pilot_energy + 0.001 * pilot * pilot;
-            self.stereo = self.pilot_energy > 1e-6;
-
-            let carrier = if self.stereo {
-                self.track_pilot(pilot);
-                let doubled = 2.0 * self.pll_phase.sin() * self.pll_phase.cos();
-                let filtered_carrier = self.carrier_bpf.process(doubled);
-                filtered_carrier
+            if self.pilot_energy > PILOT_LOCK_THRESHOLD {
+                self.pilot_lock_count = self.pilot_lock_count.saturating_add(1);
             } else {
-                0.0
-            };
+                self.pilot_lock_count = 0;
+            }
+            self.stereo = self.pilot_lock_count >= PILOT_LOCK_SAMPLES;
 
-            let l_minus_r = if self.stereo {
+            // Track pilot continuously; only decode L-R once energy is present.
+            self.track_pilot(pilot);
+            let l_minus_r = if self.pilot_energy > PILOT_LOCK_THRESHOLD {
+                let doubled = 2.0 * self.pll_phase.sin() * self.pll_phase.cos();
+                let carrier = self.carrier_bpf.process(doubled);
                 self.stereo_lpf.process(x * carrier)
             } else {
                 0.0
             };
 
-            let l = self.deemph_l.process(mono + l_minus_r);
-            let r = self.deemph_r.process(mono - l_minus_r);
-
+            let l = self.deemph_l.process((mono + l_minus_r) * 0.5);
+            let r = self.deemph_r.process((mono - l_minus_r) * 0.5);
             left.push(l as f32);
             right.push(r as f32);
         }
@@ -81,7 +84,7 @@ impl StereoDecoder {
         (left, right)
     }
 
-    fn track_pilot(&mut self, pilot: f64) -> f64 {
+    fn track_pilot(&mut self, pilot: f64) {
         let ref_sin = self.pll_phase.sin();
         let error = pilot * ref_sin;
         self.pll_freq += self.pll_alpha * error;
@@ -95,6 +98,5 @@ impl StereoDecoder {
         } else if self.pll_phase < -std::f64::consts::PI {
             self.pll_phase += 2.0 * std::f64::consts::PI;
         }
-        ref_sin
     }
 }

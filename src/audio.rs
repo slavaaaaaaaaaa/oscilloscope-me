@@ -1,10 +1,8 @@
-//! cpal stereo audio output with resampling to device rate.
+//! cpal stereo audio output; resampling happens on the SDR producer thread.
 
-use crate::demod::MPX_SAMPLE_RATE;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, Stream, StreamConfig};
 use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
-use std::sync::{Arc, Mutex};
 
 use crate::sdr::SharedRing;
 
@@ -12,7 +10,6 @@ pub struct AudioOutput {
     _stream: Stream,
     pub device_name: String,
     pub sample_rate: u32,
-    pub target_rate: u32,
 }
 
 pub fn pick_output_device(name_filter: Option<&str>) -> Result<cpal::Device, String> {
@@ -56,7 +53,7 @@ fn pick_sample_rate(device: &cpal::Device, target: u32) -> Result<u32, String> {
         .map_err(|e| e.to_string())
 }
 
-pub struct ResamplerState {
+struct ResamplerState {
     resampler: SincFixedIn<f32>,
     input_buf: Vec<f32>,
     channels: usize,
@@ -86,48 +83,68 @@ impl ResamplerState {
         }
     }
 
-    fn push_interleaved(&mut self, samples: &mut [f32]) -> usize {
-        self.input_buf.extend_from_slice(samples);
-        let chunk = self.resampler.input_frames_next();
-        let needed = chunk * self.channels;
-        if self.input_buf.len() < needed {
-            samples.fill(0.0);
-            return samples.len();
+    fn feed(&mut self, left: &[f32], right: &[f32]) -> (Vec<f32>, Vec<f32>) {
+        let len = left.len().min(right.len());
+        self.input_buf.reserve(len * 2);
+        for i in 0..len {
+            self.input_buf.push(left[i]);
+            self.input_buf.push(right[i]);
         }
 
-        let input: Vec<Vec<f32>> = (0..self.channels)
-            .map(|ch| {
-                self.input_buf
-                    .iter()
-                    .skip(ch)
-                    .step_by(self.channels)
-                    .take(chunk)
-                    .copied()
-                    .collect()
-            })
-            .collect();
+        let mut out_l = Vec::new();
+        let mut out_r = Vec::new();
 
-        self.input_buf.drain(..needed);
+        loop {
+            let chunk = self.resampler.input_frames_next();
+            let needed = chunk * self.channels;
+            if self.input_buf.len() < needed {
+                break;
+            }
 
-        match self.resampler.process(&input, None) {
-            Ok(out) => {
-                let frames = out[0].len();
-                for i in 0..frames {
-                    if i * 2 + 1 < samples.len() {
-                        samples[i * 2] = out[0][i];
-                        samples[i * 2 + 1] = out[1][i];
-                    }
-                }
-                let written = frames.min(samples.len() / 2) * 2;
-                if written < samples.len() {
-                    samples[written..].fill(0.0);
-                }
-                samples.len()
+            let input: Vec<Vec<f32>> = (0..self.channels)
+                .map(|ch| {
+                    self.input_buf
+                        .iter()
+                        .skip(ch)
+                        .step_by(self.channels)
+                        .take(chunk)
+                        .copied()
+                        .collect()
+                })
+                .collect();
+
+            self.input_buf.drain(..needed);
+
+            if let Ok(out) = self.resampler.process(&input, None) {
+                out_l.extend_from_slice(&out[0]);
+                out_r.extend_from_slice(&out[1]);
             }
-            Err(_) => {
-                samples.fill(0.0);
-                samples.len()
+        }
+
+        (out_l, out_r)
+    }
+}
+
+/// Resamples stereo L/R from demod rate to device output rate (SDR producer thread).
+pub struct StereoResampler {
+    inner: Option<ResamplerState>,
+}
+
+impl StereoResampler {
+    pub fn new(input_rate: u32, output_rate: u32) -> Self {
+        if input_rate == output_rate {
+            Self { inner: None }
+        } else {
+            Self {
+                inner: Some(ResamplerState::new(input_rate, output_rate, 256)),
             }
+        }
+    }
+
+    pub fn process(&mut self, left: &[f32], right: &[f32]) -> (Vec<f32>, Vec<f32>) {
+        match self.inner.as_mut() {
+            Some(r) => r.feed(left, right),
+            None => (left.to_vec(), right.to_vec()),
         }
     }
 }
@@ -139,13 +156,12 @@ pub fn start_audio(
 ) -> Result<AudioOutput, String> {
     let device = pick_output_device(device_filter)?;
     let device_name = device.name().unwrap_or_else(|_| "unknown".into());
-    let sample_rate = pick_sample_rate(&device, target_rate)?;
-    let negotiated = sample_rate;
+    let negotiated = pick_sample_rate(&device, target_rate)?;
 
     if negotiated < target_rate {
         eprintln!(
             "Warning: device supports max {negotiated} Hz (requested {target_rate} Hz). \
-             Scope fidelity may be reduced."
+             Playback will be resampled; scope fidelity may be reduced."
         );
     }
 
@@ -162,36 +178,23 @@ pub fn start_audio(
     let sample_format = config.sample_format();
     let channels = stream_config.channels as usize;
 
-    let needs_resample = negotiated != MPX_SAMPLE_RATE;
-    let resampler = Arc::new(Mutex::new(if needs_resample {
-        Some(ResamplerState::new(
-            MPX_SAMPLE_RATE,
-            negotiated,
-            1024,
-        ))
-    } else {
-        None
-    }));
-
     let ring_cb = ring.clone();
-    let resampler_cb = resampler.clone();
 
     let stream = match sample_format {
-        SampleFormat::F32 => build_stream::<f32>(&device, &stream_config, ring_cb, resampler_cb, channels)?,
-        SampleFormat::I16 => build_stream::<i16>(&device, &stream_config, ring_cb, resampler_cb, channels)?,
-        SampleFormat::U16 => build_stream::<u16>(&device, &stream_config, ring_cb, resampler_cb, channels)?,
+        SampleFormat::F32 => build_stream::<f32>(&device, &stream_config, ring_cb, channels)?,
+        SampleFormat::I16 => build_stream::<i16>(&device, &stream_config, ring_cb, channels)?,
+        SampleFormat::U16 => build_stream::<u16>(&device, &stream_config, ring_cb, channels)?,
         other => return Err(format!("Unsupported sample format: {other:?}")),
     };
 
     stream.play().map_err(|e| e.to_string())?;
 
-    eprintln!("Audio: {device_name} @ {negotiated} Hz");
+    eprintln!("Audio output: {device_name} @ {negotiated} Hz");
 
     Ok(AudioOutput {
         _stream: stream,
         device_name,
         sample_rate: negotiated,
-        target_rate,
     })
 }
 
@@ -199,7 +202,6 @@ fn build_stream<T>(
     device: &cpal::Device,
     config: &StreamConfig,
     ring: SharedRing,
-    resampler: Arc<Mutex<Option<ResamplerState>>>,
     channels: usize,
 ) -> Result<Stream, String>
 where
@@ -221,11 +223,6 @@ where
                 {
                     let mut ring = ring.lock().unwrap();
                     ring.read_interleaved(&mut scratch[..stereo_needed]);
-                }
-
-                let mut res = resampler.lock().unwrap();
-                if let Some(r) = res.as_mut() {
-                    r.push_interleaved(&mut scratch[..stereo_needed]);
                 }
 
                 for (i, sample) in out.iter_mut().enumerate() {

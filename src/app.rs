@@ -12,7 +12,7 @@ pub struct StereoSample {
 pub enum AppEvent {
     SdrConnected {
         freq_hz: u32,
-        sample_rate: u32,
+        gain_tenths: i32,
     },
     SdrDisconnected(String),
     StereoData {
@@ -33,9 +33,12 @@ pub struct AppState {
     pub peak_r: f32,
     pub audio_device: String,
     pub audio_rate: u32,
+    pub requested_rate: u32,
     pub display_samples: Vec<StereoSample>,
     pub status_message: String,
     pub gain_index: usize,
+    pub gain_tenths: i32,
+    pub mono_only: bool,
 }
 
 impl AppState {
@@ -47,11 +50,23 @@ impl AppState {
             is_stereo: false,
             peak_l: -120.0,
             peak_r: -120.0,
-            audio_device: "—".into(),
+            audio_device: "-".into(),
             audio_rate: 0,
+            requested_rate: 0,
             display_samples: Vec::new(),
             status_message: String::new(),
             gain_index: 0,
+            gain_tenths: -1,
+            mono_only: false,
+        }
+    }
+
+    pub fn gain_label(&self) -> String {
+        let target = GAIN_STEPS[self.gain_index];
+        if target < 0 {
+            "auto".to_string()
+        } else {
+            format!("{:.1} dB", target as f64 / 10.0)
         }
     }
 }
@@ -76,4 +91,5 @@ impl ShutdownFlag {
     }
 }
 
-pub const GAIN_STEPS: [i32; 4] = [-1, 0, 20, 40]; // -1 = auto
+/// Tuner gain targets in tenths of a dB (-1 = hardware AGC).
+pub const GAIN_STEPS: [i32; 4] = [-1, 0, 200, 400];

@@ -6,21 +6,22 @@ mod sdr;
 
 use app::{AppEvent, AppState, GAIN_STEPS, ShutdownFlag, StereoSample};
 use cpal::traits::{DeviceTrait, HostTrait};
+use crate::demod::AUDIO_SAMPLE_RATE;
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use std::io::{self, stdout, Write};
+use std::io::{self, stdout};
 use std::time::{Duration, Instant};
 
 #[derive(Parser, Debug)]
 #[command(name = "oscilloscope-me", about = "FM SDR receiver with terminal X/Y vectorscope")]
 struct Cli {
     /// FM frequency in MHz
-    #[arg(short, long)]
-    freq: Option<f64>,
+    #[arg(short, long, default_value_t = 94.1)]
+    freq: f64,
 
     /// Tuner gain in dB, or "auto"
     #[arg(short, long, default_value = "auto")]
@@ -31,12 +32,16 @@ struct Cli {
     audio_device: Option<String>,
 
     /// Target output sample rate in Hz
-    #[arg(short, long, default_value_t = 192_000)]
-    sample_rate: u32,
+    #[arg(long = "sample-rate", short = 'r', default_value_t = 192_000, value_name = "HZ")]
+    rate: u32,
 
     /// Frequency correction PPM for TCXO
     #[arg(long, default_value_t = 0)]
     ppm: i32,
+
+    /// Force mono decode (skip stereo pilot PLL — useful for debugging)
+    #[arg(long)]
+    mono: bool,
 
     /// Skip SDR wait (for testing UI without hardware)
     #[arg(long, hide = true)]
@@ -51,8 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sdr::wait_for_device()?;
     }
 
-    let freq_mhz = resolve_frequency(cli.freq)?;
-    let freq_hz = (freq_mhz * 1_000_000.0).round() as u32;
+    let freq_hz = (cli.freq * 1_000_000.0).round() as u32;
 
     let mut state = AppState::new(freq_hz, cli.ppm);
     let initial_gain = parse_gain(&cli.gain)?;
@@ -60,16 +64,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .position(|&g| g == initial_gain)
         .unwrap_or(0);
+    state.gain_tenths = GAIN_STEPS[state.gain_index];
+    state.mono_only = cli.mono;
     let ring = sdr::new_shared_ring();
     let shutdown = ShutdownFlag::new();
 
+    let input_rate = if cli.mono {
+        AUDIO_SAMPLE_RATE
+    } else {
+        crate::demod::MPX_SAMPLE_RATE
+    };
+
     let audio = audio::start_audio(
         cli.audio_device.as_deref(),
-        cli.sample_rate,
+        cli.rate,
         ring.clone(),
     )?;
     state.audio_device = audio.device_name.clone();
     state.audio_rate = audio.sample_rate;
+    state.requested_rate = cli.rate;
+
+    if input_rate != audio.sample_rate {
+        eprintln!(
+            "Demod output: {input_rate} Hz -> resampled to {} Hz for playback",
+            audio.sample_rate
+        );
+    } else {
+        eprintln!("Demod output: {input_rate} Hz (no resampling needed)");
+    }
 
     let (event_tx, event_rx) = crossbeam_channel::unbounded();
 
@@ -81,6 +103,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             freq_hz,
             cli.ppm,
             GAIN_STEPS[state.gain_index],
+            state.mono_only,
+            audio.sample_rate,
+            ring.clone(),
             event_tx.clone(),
             sdr_shutdown,
         )?)
@@ -93,7 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = setup_terminal()?;
     let tick_rate = Duration::from_millis(33);
     let mut last_tick = Instant::now();
-    let mut display_buf: Vec<StereoSample> = Vec::with_capacity(2048);
+    let mut display_buf: Vec<StereoSample> = Vec::with_capacity(display::TRACE_CAPACITY);
 
     loop {
         if shutdown.is_set() {
@@ -102,9 +127,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         while let Ok(ev) = event_rx.try_recv() {
             match ev {
-                AppEvent::SdrConnected { freq_hz, .. } => {
+                AppEvent::SdrConnected {
+                    freq_hz,
+                    gain_tenths,
+                    ..
+                } => {
                     state.sdr_connected = true;
                     state.freq_hz = freq_hz;
+                    state.gain_tenths = gain_tenths;
                     state.status_message.clear();
                 }
                 AppEvent::SdrDisconnected(msg) => {
@@ -121,12 +151,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     state.is_stereo = is_stereo;
                     state.peak_l = peak_l;
                     state.peak_r = peak_r;
-                    {
-                        let mut r = ring.lock().unwrap();
-                        r.push_frame(&left, &right);
-                    }
-                    display::downsample_for_display(&left, &right, &mut display_buf, 2048);
-                    state.display_samples = display_buf.clone();
+                    display::append_for_display(&left, &right, &mut display_buf);
+                    state.display_samples.clone_from(&display_buf);
                 }
             }
         }
@@ -145,15 +171,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     KeyCode::Char('q') | KeyCode::Esc => shutdown.set(),
                     KeyCode::Char('+') | KeyCode::Char('=') => {
                         state.freq_hz = state.freq_hz.saturating_add(100_000);
-                        restart_sdr(&mut sdr_handle, &state, &event_tx, &shutdown)?;
+                        tune_sdr(&mut sdr_handle, &mut state, &mut display_buf);
                     }
                     KeyCode::Char('-') => {
                         state.freq_hz = state.freq_hz.saturating_sub(100_000);
-                        restart_sdr(&mut sdr_handle, &state, &event_tx, &shutdown)?;
+                        tune_sdr(&mut sdr_handle, &mut state, &mut display_buf);
                     }
                     KeyCode::Char('g') => {
                         state.gain_index = (state.gain_index + 1) % GAIN_STEPS.len();
-                        restart_sdr(&mut sdr_handle, &state, &event_tx, &shutdown)?;
+                        state.gain_tenths = GAIN_STEPS[state.gain_index];
+                        if let Some(h) = sdr_handle.as_ref() {
+                            h.set_gain(state.gain_tenths);
+                        }
                     }
                     _ => {}
                 }
@@ -168,46 +197,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn restart_sdr(
+fn tune_sdr(
     handle: &mut Option<sdr::SdrHandle>,
-    state: &AppState,
-    event_tx: &crossbeam_channel::Sender<AppEvent>,
-    shutdown: &ShutdownFlag,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(h) = handle.take() {
-        h.stop();
+    state: &mut AppState,
+    display_buf: &mut Vec<StereoSample>,
+) {
+    display_buf.clear();
+    state.display_samples.clear();
+    if let Some(h) = handle.as_ref() {
+        h.set_freq(state.freq_hz);
     }
-    *handle = Some(sdr::start_capture(
-        state.freq_hz,
-        state.ppm,
-        GAIN_STEPS[state.gain_index],
-        event_tx.clone(),
-        shutdown.handle(),
-    )?);
-    Ok(())
 }
 
 fn parse_gain(gain: &str) -> Result<i32, Box<dyn std::error::Error>> {
     if gain.eq_ignore_ascii_case("auto") {
         Ok(-1)
     } else {
-        Ok(gain.parse()?)
-    }
-}
-
-fn resolve_frequency(freq: Option<f64>) -> Result<f64, Box<dyn std::error::Error>> {
-    if let Some(f) = freq {
-        return Ok(f);
-    }
-    print!("FM frequency (MHz) [88.5]: ");
-    stdout().flush()?;
-    let mut line = String::new();
-    io::stdin().read_line(&mut line)?;
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        Ok(88.5)
-    } else {
-        Ok(trimmed.parse()?)
+        // CLI accepts dB; rtl-sdr-rs expects tenths of a dB.
+        Ok(gain.parse::<i32>()? * 10)
     }
 }
 
