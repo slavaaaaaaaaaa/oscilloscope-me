@@ -45,25 +45,20 @@ impl SdrHandle {
     }
 }
 
-/// Probe whether an RTL-SDR can be opened. `get_device_count()` / `open_first_available()`
-/// also open each device just to read USB strings, which can leave the dongle busy on Linux.
-fn probe_device() -> bool {
-    match RtlSdr::open_with_index(0) {
-        Ok(mut sdr) => {
-            let _ = sdr.close();
-            thread::sleep(Duration::from_millis(200));
-            true
-        }
-        Err(_) => false,
-    }
+fn device_count() -> usize {
+    RtlSdr::get_device_count().unwrap_or(0)
 }
 
 pub fn wait_for_device() -> Result<(), String> {
     let frames = ['|', '/', '-', '\\'];
     let mut i = 0usize;
     loop {
-        if probe_device() {
-            eprintln!("\rSDR detected.          ");
+        let count = device_count();
+        if count > 0 {
+            eprintln!("\rSDR detected ({count} device(s)).          ");
+            // Enumeration briefly opens the dongle; give USB a moment to release
+            // before audio init and the real capture open.
+            thread::sleep(Duration::from_millis(300));
             return Ok(());
         }
         eprint!("\rWaiting for SDR... {}  ", frames[i % frames.len()]);
