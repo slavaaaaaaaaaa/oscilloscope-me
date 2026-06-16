@@ -2,6 +2,8 @@
 
 FM SDR receiver with a terminal **X/Y vectorscope** for [oscilloscope music](https://oscilloscopemusic.com/). Tune an FM station (e.g. ToorCamp's LOL radio), preview Lissajous shapes in the terminal, and output stereo L/R audio for an analog oscilloscope in XY mode.
 
+Try it with [Oscilloscope Music](https://oscilloscopemusic.bandcamp.com/album/oscilloscope-music).
+
 **Left = X, Right = Y**
 
 ## Hardware
@@ -78,6 +80,16 @@ cargo run --release -- -f 92.5
 2. Tunes **92.5 MHz** by default (override with `-f`)
 3. Terminal shows a live X/Y vectorscope; audio plays on the default output device
 
+### File playback (no SDR)
+
+Play an [oscilloscope music](https://oscilloscopemusic.com/) MP3 directly — left channel drives X, right channel drives Y. Useful for testing the vectorscope and driving an analog scope without tuning FM.
+
+```bash
+cargo run --release -- --file path/to/oscilloscope-music.mp3
+```
+
+Playback **loops** by default. Press `l` in the app to toggle loop, or pass `--no-loop` to play once.
+
 ### Options
 
 ```
@@ -89,6 +101,8 @@ oscilloscope-me [OPTIONS]
   -a, --audio-device <NAME>  Output device name substring
   -r, --sample-rate <HZ>     Target output rate (default: 48000)
       --ppm <PPM>            Frequency correction (default: 0)
+      --file <PATH>          Play oscilloscope music MP3 (L=X, R=Y)
+      --no-loop              Don't loop file playback
 ```
 
 ### In-app keys
@@ -96,10 +110,11 @@ oscilloscope-me [OPTIONS]
 | Key | Action |
 |-----|--------|
 | `q` / `Esc` | Quit |
-| `+` / `=` | Tune +0.1 MHz |
-| `-` | Tune −0.1 MHz |
-| `g` | Cycle gain (auto → 0 → 20 → 40 dB) |
-| `m` | Toggle mono / stereo decode |
+| `+` / `=` | Tune +0.1 MHz (SDR only) |
+| `-` | Tune −0.1 MHz (SDR only) |
+| `g` | Cycle gain (SDR only) |
+| `m` | Toggle mono / stereo decode (SDR only) |
+| `l` | Toggle loop (file mode only) |
 
 ## How it works
 

@@ -15,6 +15,12 @@ pub enum AppEvent {
         gain_tenths: i32,
     },
     SdrDisconnected(String),
+    FilePlaying {
+        path: String,
+        sample_rate: u32,
+        loop_playback: bool,
+    },
+    FileFinished,
     StereoData {
         scope_left: Vec<f32>,
         scope_right: Vec<f32>,
@@ -23,7 +29,16 @@ pub enum AppEvent {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputSource {
+    Sdr,
+    File,
+}
+
 pub struct AppState {
+    pub input_source: InputSource,
+    pub file_path: String,
+    pub file_loop: bool,
     pub freq_hz: u32,
     pub ppm: i32,
     pub sdr_connected: bool,
@@ -41,6 +56,9 @@ pub struct AppState {
 impl AppState {
     pub fn new(freq_hz: u32, ppm: i32) -> Self {
         Self {
+            input_source: InputSource::Sdr,
+            file_path: String::new(),
+            file_loop: true,
             freq_hz,
             ppm,
             sdr_connected: false,

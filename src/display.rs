@@ -1,6 +1,6 @@
 //! Terminal X/Y vectorscope using ratatui.
 
-use crate::app::{AppState, StereoSample};
+use crate::app::{AppState, InputSource, StereoSample};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Color;
 use ratatui::symbols::Marker;
@@ -119,7 +119,7 @@ pub fn draw(frame: &mut Frame, state: &AppState, display_buf: &[StereoSample], p
 
     draw_status(frame, chunks[0], state);
     draw_vectorscope(frame, chunks[1], display_buf, phosphor);
-    draw_help(frame, chunks[2]);
+    draw_help(frame, chunks[2], state);
 }
 
 fn truncate_name(name: &str) -> String {
@@ -159,15 +159,15 @@ fn format_audio_rate(actual: u32, requested: u32) -> String {
     }
 }
 
+fn truncate_path(path: &str) -> String {
+    let name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(path);
+    truncate_name(name)
+}
+
 fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
-    let freq_mhz = state.freq_hz as f64 / 1_000_000.0;
-    let mode = decode_mode_label(state);
-    let sdr = if state.sdr_connected {
-        "SDR OK"
-    } else {
-        "SDR --"
-    };
-    let gain = state.gain_label();
     let device = truncate_name(&state.audio_device);
     let status = if state.status_message.is_empty() {
         String::new()
@@ -177,12 +177,35 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
             state.status_message.lines().next().unwrap_or("")
         )
     };
-    let text = format!(
-        " {freq_mhz:.1} MHz | {sdr} | {mode} | gain {gain} | {device} @ {} | L {} dBFS | R {} dBFS{status}",
-        format_audio_rate(state.audio_rate, state.requested_rate),
-        format_peak_db(state.peak_l),
-        format_peak_db(state.peak_r),
-    );
+
+    let text = match state.input_source {
+        InputSource::File => {
+            let file = truncate_path(&state.file_path);
+            let loop_label = if state.file_loop { "loop" } else { "once" };
+            format!(
+                " FILE {file} | {loop_label} | {device} @ {} | L {} dBFS | R {} dBFS{status}",
+                format_audio_rate(state.audio_rate, state.requested_rate),
+                format_peak_db(state.peak_l),
+                format_peak_db(state.peak_r),
+            )
+        }
+        InputSource::Sdr => {
+            let freq_mhz = state.freq_hz as f64 / 1_000_000.0;
+            let mode = decode_mode_label(state);
+            let sdr = if state.sdr_connected {
+                "SDR OK"
+            } else {
+                "SDR --"
+            };
+            let gain = state.gain_label();
+            format!(
+                " {freq_mhz:.1} MHz | {sdr} | {mode} | gain {gain} | {device} @ {} | L {} dBFS | R {} dBFS{status}",
+                format_audio_rate(state.audio_rate, state.requested_rate),
+                format_peak_db(state.peak_l),
+                format_peak_db(state.peak_r),
+            )
+        }
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" oscilloscope-me ");
@@ -235,8 +258,11 @@ fn draw_vectorscope(frame: &mut Frame, area: Rect, samples: &[StereoSample], pho
         .render(area, frame.buffer_mut());
 }
 
-fn draw_help(frame: &mut Frame, area: Rect) {
-    let text = " q quit | + / - tune | g gain | m mono/stereo ";
+fn draw_help(frame: &mut Frame, area: Rect, state: &AppState) {
+    let text = match state.input_source {
+        InputSource::File => " q quit | l loop on/off ",
+        InputSource::Sdr => " q quit | + / - tune | g gain | m mono/stereo ",
+    };
     let para = Paragraph::new(text);
     frame.render_widget(para, area);
 }

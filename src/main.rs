@@ -2,6 +2,7 @@ mod app;
 mod audio;
 mod demod;
 mod display;
+mod file;
 mod sdr;
 
 use app::{AppEvent, AppState, GAIN_STEPS, ShutdownFlag, StereoSample};
@@ -46,6 +47,14 @@ struct Cli {
     #[arg(long)]
     mono: bool,
 
+    /// Play oscilloscope music MP3 instead of SDR (L = X, R = Y)
+    #[arg(long, value_name = "PATH")]
+    file: Option<std::path::PathBuf>,
+
+    /// Don't loop file playback (default: loop)
+    #[arg(long)]
+    no_loop: bool,
+
     /// Skip SDR wait (for testing UI without hardware)
     #[arg(long, hide = true)]
     no_sdr: bool,
@@ -55,7 +64,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     print_diagnostics();
 
-    if !cli.no_sdr {
+    let file_mode = cli.file.is_some();
+
+    if !cli.no_sdr && !file_mode {
         sdr::wait_for_device()?;
     }
 
@@ -69,6 +80,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(0);
     state.gain_tenths = GAIN_STEPS[state.gain_index];
     state.mono_only = cli.mono;
+    if file_mode {
+        state.input_source = app::InputSource::File;
+        state.file_loop = !cli.no_loop;
+    }
     let ring = sdr::new_shared_ring();
     let shutdown = ShutdownFlag::new();
 
@@ -83,7 +98,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     state.audio_rate = audio.sample_rate;
     state.requested_rate = cli.rate;
 
-    if input_rate != audio.sample_rate {
+    if file_mode {
+        eprintln!("File input mode (no SDR demod)");
+    } else if input_rate != audio.sample_rate {
         eprintln!(
             "Demod output: {input_rate} Hz -> resampled to {} Hz for playback",
             audio.sample_rate
@@ -95,7 +112,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (event_tx, event_rx) = crossbeam_channel::unbounded();
 
     let sdr_shutdown = shutdown.handle();
-    let mut sdr_handle = if cli.no_sdr {
+    let mut sdr_handle = if cli.no_sdr || file_mode {
         None
     } else {
         Some(sdr::start_capture(
@@ -108,6 +125,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             event_tx.clone(),
             sdr_shutdown,
         )?)
+    };
+
+    let file_handle = if let Some(path) = cli.file {
+        let track = file::decode_mp3(&path)?;
+        eprintln!(
+            "Loaded {} — {:.1}s @ {} Hz{}",
+            path.display(),
+            track.left.len() as f64 / track.sample_rate as f64,
+            track.sample_rate,
+            if state.file_loop { " (loop)" } else { "" }
+        );
+        if track.sample_rate != audio.sample_rate {
+            eprintln!(
+                "File resampled: {} Hz -> {} Hz for playback",
+                track.sample_rate, audio.sample_rate
+            );
+        }
+        Some(file::start_playback(
+            path,
+            track,
+            audio.sample_rate,
+            state.file_loop,
+            ring.clone(),
+            event_tx.clone(),
+            shutdown.handle(),
+        )?)
+    } else {
+        None
     };
 
     let shutdown_sig = shutdown.handle();
@@ -144,6 +189,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             state.sdr_connected = false;
                             state.status_message = msg;
                         }
+                        AppEvent::FilePlaying {
+                            path,
+                            sample_rate,
+                            loop_playback,
+                        } => {
+                            state.file_path = path;
+                            state.file_loop = loop_playback;
+                            state.status_message.clear();
+                            eprintln!("Playing @ {sample_rate} Hz");
+                        }
+                        AppEvent::FileFinished => {
+                            state.status_message = "Playback finished".into();
+                        }
                         AppEvent::StereoData {
                             scope_left,
                             scope_right,
@@ -178,26 +236,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => shutdown.set(),
-                    KeyCode::Char('+') | KeyCode::Char('=') => {
+                    KeyCode::Char('+') | KeyCode::Char('=') if sdr_handle.is_some() => {
                         state.freq_hz = state.freq_hz.saturating_add(100_000);
                         tune_sdr(&mut sdr_handle, &mut state, &mut display_buf, &mut phosphor);
                     }
-                    KeyCode::Char('-') => {
+                    KeyCode::Char('-') if sdr_handle.is_some() => {
                         state.freq_hz = state.freq_hz.saturating_sub(100_000);
                         tune_sdr(&mut sdr_handle, &mut state, &mut display_buf, &mut phosphor);
                     }
-                    KeyCode::Char('g') => {
+                    KeyCode::Char('g') if sdr_handle.is_some() => {
                         state.gain_index = (state.gain_index + 1) % GAIN_STEPS.len();
                         state.gain_tenths = GAIN_STEPS[state.gain_index];
                         if let Some(h) = sdr_handle.as_ref() {
                             h.set_gain(state.gain_tenths);
                         }
                     }
-                    KeyCode::Char('m') => {
+                    KeyCode::Char('m') if sdr_handle.is_some() => {
                         state.mono_only = !state.mono_only;
                         reset_display(&mut display_buf, &mut phosphor);
                         if let Some(h) = sdr_handle.as_ref() {
                             h.set_mono(state.mono_only);
+                        }
+                    }
+                    KeyCode::Char('l') if file_handle.is_some() => {
+                        state.file_loop = !state.file_loop;
+                        if let Some(h) = file_handle.as_ref() {
+                            h.set_loop(state.file_loop);
                         }
                     }
                     _ => {}
@@ -207,6 +271,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Some(h) = sdr_handle {
+        h.stop();
+    }
+    if let Some(h) = file_handle {
         h.stop();
     }
     teardown_terminal(&mut terminal)?;
