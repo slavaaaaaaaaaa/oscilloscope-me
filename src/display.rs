@@ -198,8 +198,13 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
                 "SDR --"
             };
             let gain = state.gain_label();
+            let ppm = if state.ppm != 0 {
+                format!(" | ppm {}", state.ppm)
+            } else {
+                String::new()
+            };
             format!(
-                " {freq_mhz:.1} MHz | {sdr} | {mode} | gain {gain} | {device} @ {} | L {} dBFS | R {} dBFS{status}",
+                " {freq_mhz:.1} MHz | {sdr} | {mode} | gain {gain}{ppm} | {device} @ {} | L {} dBFS | R {} dBFS{status}",
                 format_audio_rate(state.audio_rate, state.requested_rate),
                 format_peak_db(state.peak_l),
                 format_peak_db(state.peak_r),

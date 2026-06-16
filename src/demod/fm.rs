@@ -76,12 +76,6 @@ impl StereoAudioDecimator {
         }
     }
 
-    pub fn reset(&mut self) {
-        self.acc_l = 0.0;
-        self.acc_r = 0.0;
-        self.prev_index = 0;
-    }
-
     pub fn process(&mut self, left: &[f32], right: &[f32]) -> (Vec<f32>, Vec<f32>) {
         let mut out_l = Vec::new();
         let mut out_r = Vec::new();
@@ -123,10 +117,6 @@ impl RtlFmReceiver {
             lp_now: Complex::new(0, 0),
             demod_pre: Complex::new(0, 0),
         }
-    }
-
-    pub fn config(&self) -> DemodConfig {
-        self.config
     }
 
     /// Full MPX discriminator output at MPX_SAMPLE_RATE (for stereo decode).
