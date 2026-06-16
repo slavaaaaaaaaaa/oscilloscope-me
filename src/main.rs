@@ -16,11 +16,14 @@ use ratatui::Terminal;
 use std::io::{self, stdout};
 use std::time::{Duration, Instant};
 
+const TICK_MS: u64 = 16;
+const MAX_EVENTS_PER_FRAME: usize = 2;
+
 #[derive(Parser, Debug)]
 #[command(name = "oscilloscope-me", about = "FM SDR receiver with terminal X/Y vectorscope")]
 struct Cli {
     /// FM frequency in MHz
-    #[arg(short, long, default_value_t = 94.1)]
+    #[arg(short, long, default_value_t = 92.5)]
     freq: f64,
 
     /// Tuner gain in dB, or "auto"
@@ -32,14 +35,14 @@ struct Cli {
     audio_device: Option<String>,
 
     /// Target output sample rate in Hz
-    #[arg(long = "sample-rate", short = 'r', default_value_t = 192_000, value_name = "HZ")]
+    #[arg(long = "sample-rate", short = 'r', default_value_t = 48_000, value_name = "HZ")]
     rate: u32,
 
     /// Frequency correction PPM for TCXO
     #[arg(long, default_value_t = 0)]
     ppm: i32,
 
-    /// Force mono decode (skip stereo pilot PLL — useful for debugging)
+    /// Start in mono decode mode
     #[arg(long)]
     mono: bool,
 
@@ -69,11 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ring = sdr::new_shared_ring();
     let shutdown = ShutdownFlag::new();
 
-    let input_rate = if cli.mono {
-        AUDIO_SAMPLE_RATE
-    } else {
-        crate::demod::MPX_SAMPLE_RATE
-    };
+    let input_rate = AUDIO_SAMPLE_RATE;
 
     let audio = audio::start_audio(
         cli.audio_device.as_deref(),
@@ -111,58 +110,68 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?)
     };
 
-    // ctrl-c handler
     let shutdown_sig = shutdown.handle();
     ctrlc_handler(shutdown_sig);
 
     let mut terminal = setup_terminal()?;
-    let tick_rate = Duration::from_millis(33);
+    let tick_rate = Duration::from_millis(TICK_MS);
     let mut last_tick = Instant::now();
     let mut display_buf: Vec<StereoSample> = Vec::with_capacity(display::TRACE_CAPACITY);
+    let mut phosphor = display::Phosphor::new();
 
     loop {
         if shutdown.is_set() {
             break;
         }
 
-        while let Ok(ev) = event_rx.try_recv() {
-            match ev {
-                AppEvent::SdrConnected {
-                    freq_hz,
-                    gain_tenths,
-                    ..
-                } => {
-                    state.sdr_connected = true;
-                    state.freq_hz = freq_hz;
-                    state.gain_tenths = gain_tenths;
-                    state.status_message.clear();
+        let mut events_processed = 0usize;
+        while events_processed < MAX_EVENTS_PER_FRAME {
+            match event_rx.try_recv() {
+                Ok(ev) => {
+                    events_processed += 1;
+                    match ev {
+                        AppEvent::SdrConnected {
+                            freq_hz,
+                            gain_tenths,
+                            ..
+                        } => {
+                            state.sdr_connected = true;
+                            state.freq_hz = freq_hz;
+                            state.gain_tenths = gain_tenths;
+                            state.status_message.clear();
+                        }
+                        AppEvent::SdrDisconnected(msg) => {
+                            state.sdr_connected = false;
+                            state.status_message = msg;
+                        }
+                        AppEvent::StereoData {
+                            scope_left,
+                            scope_right,
+                            peak_l,
+                            peak_r,
+                        } => {
+                            state.peak_l = peak_l;
+                            state.peak_r = peak_r;
+                            display::append_for_display(&scope_left, &scope_right, &mut display_buf);
+                            phosphor.splat(&scope_left, &scope_right);
+                        }
+                    }
                 }
-                AppEvent::SdrDisconnected(msg) => {
-                    state.sdr_connected = false;
-                    state.status_message = msg;
-                }
-                AppEvent::StereoData {
-                    left,
-                    right,
-                    is_stereo,
-                    peak_l,
-                    peak_r,
-                } => {
-                    state.is_stereo = is_stereo;
-                    state.peak_l = peak_l;
-                    state.peak_r = peak_r;
-                    display::append_for_display(&left, &right, &mut display_buf);
-                    state.display_samples.clone_from(&display_buf);
-                }
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
             }
         }
 
         if last_tick.elapsed() >= tick_rate {
-            terminal.draw(|f| display::draw(f, &state))?;
+            terminal.draw(|f| display::draw(f, &state, &display_buf, &mut phosphor))?;
             last_tick = Instant::now();
         }
 
-        if event::poll(Duration::from_millis(16))? {
+        let poll_ms = tick_rate
+            .saturating_sub(last_tick.elapsed())
+            .as_millis()
+            .min(16) as u64;
+        if event::poll(Duration::from_millis(poll_ms.max(1)))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;
@@ -171,17 +180,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     KeyCode::Char('q') | KeyCode::Esc => shutdown.set(),
                     KeyCode::Char('+') | KeyCode::Char('=') => {
                         state.freq_hz = state.freq_hz.saturating_add(100_000);
-                        tune_sdr(&mut sdr_handle, &mut state, &mut display_buf);
+                        tune_sdr(&mut sdr_handle, &mut state, &mut display_buf, &mut phosphor);
                     }
                     KeyCode::Char('-') => {
                         state.freq_hz = state.freq_hz.saturating_sub(100_000);
-                        tune_sdr(&mut sdr_handle, &mut state, &mut display_buf);
+                        tune_sdr(&mut sdr_handle, &mut state, &mut display_buf, &mut phosphor);
                     }
                     KeyCode::Char('g') => {
                         state.gain_index = (state.gain_index + 1) % GAIN_STEPS.len();
                         state.gain_tenths = GAIN_STEPS[state.gain_index];
                         if let Some(h) = sdr_handle.as_ref() {
                             h.set_gain(state.gain_tenths);
+                        }
+                    }
+                    KeyCode::Char('m') => {
+                        state.mono_only = !state.mono_only;
+                        reset_display(&mut display_buf, &mut phosphor);
+                        if let Some(h) = sdr_handle.as_ref() {
+                            h.set_mono(state.mono_only);
                         }
                     }
                     _ => {}
@@ -201,19 +217,23 @@ fn tune_sdr(
     handle: &mut Option<sdr::SdrHandle>,
     state: &mut AppState,
     display_buf: &mut Vec<StereoSample>,
+    phosphor: &mut display::Phosphor,
 ) {
-    display_buf.clear();
-    state.display_samples.clear();
+    reset_display(display_buf, phosphor);
     if let Some(h) = handle.as_ref() {
         h.set_freq(state.freq_hz);
     }
+}
+
+fn reset_display(display_buf: &mut Vec<StereoSample>, phosphor: &mut display::Phosphor) {
+    display_buf.clear();
+    phosphor.clear();
 }
 
 fn parse_gain(gain: &str) -> Result<i32, Box<dyn std::error::Error>> {
     if gain.eq_ignore_ascii_case("auto") {
         Ok(-1)
     } else {
-        // CLI accepts dB; rtl-sdr-rs expects tenths of a dB.
         Ok(gain.parse::<i32>()? * 10)
     }
 }

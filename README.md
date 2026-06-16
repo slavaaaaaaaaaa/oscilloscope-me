@@ -62,20 +62,20 @@ For a permanent fix, blacklist those modules (see [rtl-sdr-rs Linux notes](https
 cargo run --release
 ```
 
-**If you hear static**, try the proven mono demod path first (same algorithm as `rtl_fm`):
+**If you hear static**, try the proven mono demod path (same algorithm as `rtl_fm`):
 
 ```bash
-cargo run --release -- --mono -f 94.1 -r 48000
+cargo run --release -- --mono -f 92.5
 ```
 
-Stereo / scope mode (higher sample rate for X/Y output):
+Stereo / scope mode:
 
 ```bash
-cargo run --release -- -f 94.1 -r 192000
+cargo run --release -- -f 92.5
 ```
 
 1. Plug in the SDR — the app waits until one is detected
-2. Tunes **94.1 MHz** by default (override with `-f`)
+2. Tunes **92.5 MHz** by default (override with `-f`)
 3. Terminal shows a live X/Y vectorscope; audio plays on the default output device
 
 ### Options
@@ -83,11 +83,11 @@ cargo run --release -- -f 94.1 -r 192000
 ```
 oscilloscope-me [OPTIONS]
 
-  -f, --freq <MHZ>           FM frequency in MHz
+  -f, --freq <MHZ>           FM frequency in MHz (default: 92.5)
   -g, --gain <DB|auto>       Tuner gain (default: auto)
-      --mono                 Force mono decode (skip stereo PLL)
+      --mono                 Start in mono decode mode
   -a, --audio-device <NAME>  Output device name substring
-  -r, --sample-rate <HZ>     Target output rate (default: 192000)
+  -r, --sample-rate <HZ>     Target output rate (default: 48000)
       --ppm <PPM>            Frequency correction (default: 0)
 ```
 
@@ -99,15 +99,17 @@ oscilloscope-me [OPTIONS]
 | `+` / `=` | Tune +0.1 MHz |
 | `-` | Tune −0.1 MHz |
 | `g` | Cycle gain (auto → 0 → 20 → 40 dB) |
+| `m` | Toggle mono / stereo decode |
 
 ## How it works
 
 ```
 RTL-SDR IQ → FM quadrature demod → stereo MPX decode (19 kHz pilot)
-          → de-emphasis → L/R audio (cpal) + terminal vectorscope
+          → rtl_fm decimate to 48 kHz → de-emphasis → L/R audio (cpal)
+          → decimated scope samples → terminal vectorscope (~60 FPS)
 ```
 
-Internal MPX processing runs at **192 kHz**; audio is resampled to the best rate your output device supports (192 kHz preferred).
+Internal MPX processing runs at **170 kHz**. Audio is decimated to **48 kHz** (rtl_fm integer ratio) before de-emphasis and playback. The vectorscope uses a short rolling window with auto-scaling so Lissajous shapes stay crisp.
 
 ## License
 

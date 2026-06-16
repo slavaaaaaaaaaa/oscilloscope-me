@@ -3,16 +3,19 @@ mod fm;
 mod stereo;
 
 pub use fm::{
-    configure_sdr, optimal_settings, DemodConfig, MPX_SAMPLE_RATE, RadioConfig, RtlFmReceiver,
-    AUDIO_SAMPLE_RATE,
+    configure_sdr, optimal_settings, DemodConfig, MPX_SAMPLE_RATE, RtlFmReceiver,
+    StereoAudioDecimator, AUDIO_SAMPLE_RATE,
 };
 pub use stereo::StereoDecoder;
 
 pub struct DemodPipeline {
     fm: RtlFmReceiver,
     stereo: StereoDecoder,
+    decimator: StereoAudioDecimator,
     mono_only: bool,
     mono_deemph: filters::Deemphasis,
+    deemph_l: filters::Deemphasis,
+    deemph_r: filters::Deemphasis,
 }
 
 impl DemodPipeline {
@@ -20,8 +23,11 @@ impl DemodPipeline {
         Self {
             fm: RtlFmReceiver::new(config),
             stereo: StereoDecoder::new(),
+            decimator: StereoAudioDecimator::new(&config),
             mono_only,
             mono_deemph: filters::Deemphasis::us_broadcast(AUDIO_SAMPLE_RATE as f64),
+            deemph_l: filters::Deemphasis::us_broadcast(AUDIO_SAMPLE_RATE as f64),
+            deemph_r: filters::Deemphasis::us_broadcast(AUDIO_SAMPLE_RATE as f64),
         }
     }
 
@@ -33,24 +39,35 @@ impl DemodPipeline {
             }
             limit_samples(&mut mono);
             let peak_l = peak_dbfs(&mono);
+            let audio_l = mono.clone();
+            let audio_r = mono;
             return StereoFrame {
-                left: mono.clone(),
-                right: mono,
-                is_stereo: false,
+                audio_left: audio_l,
+                audio_right: audio_r,
+                scope_left: Vec::new(),
+                scope_right: Vec::new(),
                 peak_l,
                 peak_r: peak_l,
             };
         }
 
         let mpx = self.fm.process_mpx(iq);
-        let (mut left, mut right) = self.stereo.process_mpx(&mpx);
-        limit_stereo(&mut left, &mut right);
-        let peak_l = peak_dbfs(&left);
-        let peak_r = peak_dbfs(&right);
+        let (scope_l, scope_r) = self.stereo.process_mpx(&mpx);
+        let (mut audio_l, mut audio_r) = self.decimator.process(&scope_l, &scope_r);
+        for s in audio_l.iter_mut() {
+            *s = self.deemph_l.process(*s as f64) as f32;
+        }
+        for s in audio_r.iter_mut() {
+            *s = self.deemph_r.process(*s as f64) as f32;
+        }
+        limit_stereo(&mut audio_l, &mut audio_r);
+        let peak_l = peak_dbfs(&audio_l);
+        let peak_r = peak_dbfs(&audio_r);
         StereoFrame {
-            left,
-            right,
-            is_stereo: self.stereo.is_stereo(),
+            audio_left: audio_l,
+            audio_right: audio_r,
+            scope_left: scope_l,
+            scope_right: scope_r,
             peak_l,
             peak_r,
         }
@@ -58,9 +75,10 @@ impl DemodPipeline {
 }
 
 pub struct StereoFrame {
-    pub left: Vec<f32>,
-    pub right: Vec<f32>,
-    pub is_stereo: bool,
+    pub audio_left: Vec<f32>,
+    pub audio_right: Vec<f32>,
+    pub scope_left: Vec<f32>,
+    pub scope_right: Vec<f32>,
     pub peak_l: f32,
     pub peak_r: f32,
 }
@@ -116,7 +134,7 @@ mod tests {
 
     #[test]
     fn lowpass_attenuates_high_frequency() {
-        let sample_rate = 192_000.0;
+        let sample_rate = 170_000.0;
         let mut lpf_low = Biquad::lowpass(sample_rate, 15_000.0, 0.707);
         let mut lpf_high = Biquad::lowpass(sample_rate, 15_000.0, 0.707);
         let mut low_out = 0.0;
@@ -132,7 +150,7 @@ mod tests {
 
     #[test]
     fn deemphasis_smoothes_steps() {
-        let mut de = Deemphasis::us_broadcast(192_000.0);
+        let mut de = Deemphasis::us_broadcast(170_000.0);
         let first = de.process(1.0);
         let second = de.process(1.0);
         assert!(second > first);

@@ -5,6 +5,7 @@ use crate::audio::StereoResampler;
 use crate::demod::{
     configure_sdr, optimal_settings, DemodPipeline, AUDIO_SAMPLE_RATE, MPX_SAMPLE_RATE,
 };
+use crate::display::decimate_scope_pair;
 use rtl_sdr_rs::{RtlSdr, DEFAULT_BUF_LENGTH};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -14,6 +15,7 @@ use std::time::Duration;
 enum SdrCommand {
     SetFreq(u32),
     SetGain(i32),
+    SetMono(bool),
 }
 
 pub struct SdrHandle {
@@ -29,6 +31,10 @@ impl SdrHandle {
 
     pub fn set_gain(&self, gain_db: i32) {
         let _ = self.cmd_tx.send(SdrCommand::SetGain(gain_db));
+    }
+
+    pub fn set_mono(&self, mono: bool) {
+        let _ = self.cmd_tx.send(SdrCommand::SetMono(mono));
     }
 
     pub fn stop(mut self) {
@@ -114,7 +120,7 @@ fn capture_loop(
     freq_hz: u32,
     ppm: i32,
     gain_db: i32,
-    mono_only: bool,
+    mut mono_only: bool,
     device_rate: u32,
     ring: SharedRing,
     event_tx: crossbeam_channel::Sender<AppEvent>,
@@ -122,12 +128,7 @@ fn capture_loop(
     stop: Arc<AtomicBool>,
     app_shutdown: Arc<AtomicBool>,
 ) {
-    let demod_rate = if mono_only {
-        AUDIO_SAMPLE_RATE
-    } else {
-        MPX_SAMPLE_RATE
-    };
-    let mut resampler = StereoResampler::new(demod_rate, device_rate);
+    let mut resampler = StereoResampler::new(AUDIO_SAMPLE_RATE, device_rate);
     let mut freq_hz = freq_hz;
     let mut gain_db = gain_db;
 
@@ -198,6 +199,14 @@ fn capture_loop(
                             });
                         }
                     }
+                    SdrCommand::SetMono(mono) => {
+                        mono_only = mono;
+                        demod = DemodPipeline::new(demod_config, mono_only);
+                        resampler.reset(AUDIO_SAMPLE_RATE, device_rate);
+                        if let Ok(mut r) = ring.lock() {
+                            r.clear();
+                        }
+                    }
                 }
             }
 
@@ -205,16 +214,22 @@ fn capture_loop(
                 Ok(n) if n >= DEFAULT_BUF_LENGTH => {
                     let frame = demod.process_iq(&buf);
 
-                    let (audio_l, audio_r) = resampler.process(&frame.left, &frame.right);
+                    let (audio_l, audio_r) = resampler.process(&frame.audio_left, &frame.audio_right);
                     {
                         let mut r = ring.lock().unwrap();
                         r.push_frame(&audio_l, &audio_r);
                     }
 
+                    let (scope_src_l, scope_src_r) = if mono_only {
+                        (&audio_l[..], &audio_r[..])
+                    } else {
+                        (&frame.scope_left[..], &frame.scope_right[..])
+                    };
+                    let (scope_l, scope_r) = decimate_scope_pair(scope_src_l, scope_src_r, 192);
+
                     let _ = event_tx.send(AppEvent::StereoData {
-                        left: frame.left,
-                        right: frame.right,
-                        is_stereo: frame.is_stereo,
+                        scope_left: scope_l,
+                        scope_right: scope_r,
                         peak_l: frame.peak_l,
                         peak_r: frame.peak_r,
                     });
@@ -240,6 +255,9 @@ fn capture_loop(
     }
 }
 
+/// ~200 ms of stereo audio at 48 kHz.
+const MAX_RING_SAMPLES: usize = 9_600;
+
 pub struct SampleRing {
     left: Vec<f32>,
     right: Vec<f32>,
@@ -264,17 +282,16 @@ impl SampleRing {
     pub fn push_frame(&mut self, left: &[f32], right: &[f32]) {
         self.left.extend_from_slice(left);
         self.right.extend_from_slice(right);
-        const MAX: usize = 192_000;
-        if self.left.len() > MAX {
-            let drop = self.left.len() - MAX;
+        if self.left.len() > MAX_RING_SAMPLES {
+            let drop = self.left.len() - MAX_RING_SAMPLES;
             self.left.drain(..drop);
             self.right.drain(..drop);
             self.read_pos = self.read_pos.saturating_sub(drop);
         }
     }
 
-    pub fn read_interleaved(&mut self, out: &mut [f32]) {
-        out.fill(0.0);
+    /// Read interleaved L/R into `out`. Returns number of stereo frames read.
+    pub fn read_interleaved(&mut self, out: &mut [f32]) -> usize {
         let available = self.left.len().saturating_sub(self.read_pos);
         let frames = available.min(out.len() / 2);
         for i in 0..frames {
@@ -287,6 +304,7 @@ impl SampleRing {
             self.right.drain(..self.read_pos);
             self.read_pos = 0;
         }
+        frames
     }
 }
 

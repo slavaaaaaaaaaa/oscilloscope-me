@@ -1,7 +1,7 @@
-//! cpal stereo audio output; resampling happens on the SDR producer thread.
+//! cpal stereo audio output.
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{FromSample, Sample, SampleFormat, Stream, StreamConfig};
+use cpal::{BufferSize, FromSample, Sample, SampleFormat, Stream, StreamConfig, SupportedBufferSize};
 use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
 
 use crate::sdr::SharedRing;
@@ -33,7 +33,7 @@ pub fn pick_output_device(name_filter: Option<&str>) -> Result<cpal::Device, Str
 }
 
 fn pick_sample_rate(device: &cpal::Device, target: u32) -> Result<u32, String> {
-    let preferred = [target, 192_000, 96_000, 48_000, 44_100];
+    let preferred = [target, 48_000, 96_000, 192_000, 44_100];
     let configs: Vec<_> = device
         .supported_output_configs()
         .map_err(|e| e.to_string())?
@@ -125,7 +125,7 @@ impl ResamplerState {
     }
 }
 
-/// Resamples stereo L/R from demod rate to device output rate (SDR producer thread).
+/// Resamples stereo L/R when device rate differs from demod output (48 kHz).
 pub struct StereoResampler {
     inner: Option<ResamplerState>,
 }
@@ -139,6 +139,10 @@ impl StereoResampler {
                 inner: Some(ResamplerState::new(input_rate, output_rate, 256)),
             }
         }
+    }
+
+    pub fn reset(&mut self, input_rate: u32, output_rate: u32) {
+        *self = Self::new(input_rate, output_rate);
     }
 
     pub fn process(&mut self, left: &[f32], right: &[f32]) -> (Vec<f32>, Vec<f32>) {
@@ -161,11 +165,11 @@ pub fn start_audio(
     if negotiated < target_rate {
         eprintln!(
             "Warning: device supports max {negotiated} Hz (requested {target_rate} Hz). \
-             Playback will be resampled; scope fidelity may be reduced."
+             Playback will be resampled."
         );
     }
 
-    let config = device
+    let stream_config_range = device
         .supported_output_configs()
         .map_err(|e| e.to_string())?
         .find(|c| {
@@ -174,8 +178,12 @@ pub fn start_audio(
         .ok_or_else(|| "No supported config for chosen sample rate".to_string())?
         .with_sample_rate(cpal::SampleRate(negotiated));
 
-    let stream_config: StreamConfig = config.config();
-    let sample_format = config.sample_format();
+    let sample_format = stream_config_range.sample_format();
+    let mut stream_config: StreamConfig = stream_config_range.config();
+    if let SupportedBufferSize::Range { min, max } = stream_config_range.buffer_size() {
+        let size = 1024u32.clamp(*min, *max);
+        stream_config.buffer_size = BufferSize::Fixed(size);
+    }
     let channels = stream_config.channels as usize;
 
     let ring_cb = ring.clone();
@@ -208,6 +216,8 @@ where
     T: Sample + cpal::SizedSample + FromSample<f32>,
 {
     let mut scratch = vec![0.0f32; 4096];
+    let mut hold_l = 0.0f32;
+    let mut hold_r = 0.0f32;
     let err_fn = |e| eprintln!("Audio stream error: {e}");
 
     device
@@ -220,17 +230,42 @@ where
                     scratch.resize(stereo_needed, 0.0);
                 }
 
-                {
+                let got = {
                     let mut ring = ring.lock().unwrap();
-                    ring.read_interleaved(&mut scratch[..stereo_needed]);
+                    ring.read_interleaved(&mut scratch[..stereo_needed])
+                };
+
+                for frame in 0..frames {
+                    let l = if frame < got {
+                        scratch[frame * 2]
+                    } else {
+                        hold_l
+                    };
+                    let r = if frame < got {
+                        scratch[frame * 2 + 1]
+                    } else {
+                        hold_r
+                    };
+                    if frame < got {
+                        hold_l = l;
+                        hold_r = r;
+                    }
                 }
 
                 for (i, sample) in out.iter_mut().enumerate() {
                     let ch = i % channels;
                     let src = if ch == 0 {
-                        scratch[(i / channels) * 2]
+                        if i / channels < got {
+                            scratch[(i / channels) * 2]
+                        } else {
+                            hold_l
+                        }
                     } else if ch == 1 {
-                        scratch[(i / channels) * 2 + 1]
+                        if i / channels < got {
+                            scratch[(i / channels) * 2 + 1]
+                        } else {
+                            hold_r
+                        }
                     } else {
                         0.0
                     };

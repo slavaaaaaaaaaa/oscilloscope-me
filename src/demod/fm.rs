@@ -4,7 +4,7 @@ use num_complex::Complex;
 use rtl_sdr_rs::RtlSdr;
 use std::f64::consts::PI;
 
-pub const MPX_SAMPLE_RATE: u32 = 192_000;
+pub const MPX_SAMPLE_RATE: u32 = 170_000;
 pub const AUDIO_SAMPLE_RATE: u32 = 48_000;
 
 pub struct RadioConfig {
@@ -54,6 +54,55 @@ pub fn configure_sdr(
     Ok(())
 }
 
+/// rtl_fm-compatible integer-ratio decimator (170 kHz → 48 kHz).
+pub struct StereoAudioDecimator {
+    acc_l: f64,
+    acc_r: f64,
+    prev_index: i32,
+    slow: i32,
+    fast: i32,
+    ratio: i32,
+}
+
+impl StereoAudioDecimator {
+    pub fn new(config: &DemodConfig) -> Self {
+        Self {
+            acc_l: 0.0,
+            acc_r: 0.0,
+            prev_index: 0,
+            slow: config.rate_resample as i32,
+            fast: config.rate_out as i32,
+            ratio: (config.rate_out / config.rate_resample) as i32,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.acc_l = 0.0;
+        self.acc_r = 0.0;
+        self.prev_index = 0;
+    }
+
+    pub fn process(&mut self, left: &[f32], right: &[f32]) -> (Vec<f32>, Vec<f32>) {
+        let mut out_l = Vec::new();
+        let mut out_r = Vec::new();
+        let len = left.len().min(right.len());
+        for i in 0..len {
+            self.acc_l += left[i] as f64;
+            self.acc_r += right[i] as f64;
+            self.prev_index += self.slow;
+            if self.prev_index < self.fast {
+                continue;
+            }
+            out_l.push((self.acc_l / self.ratio as f64) as f32);
+            out_r.push((self.acc_r / self.ratio as f64) as f32);
+            self.prev_index -= self.fast;
+            self.acc_l = 0.0;
+            self.acc_r = 0.0;
+        }
+        (out_l, out_r)
+    }
+}
+
 /// rtl_fm-compatible FM receiver: IQ bytes -> MPX (170 kHz) and/or audio (48 kHz mono).
 pub struct RtlFmReceiver {
     config: DemodConfig,
@@ -76,7 +125,11 @@ impl RtlFmReceiver {
         }
     }
 
-    /// Full MPX discriminator output at 170 kHz (for stereo decode).
+    pub fn config(&self) -> DemodConfig {
+        self.config
+    }
+
+    /// Full MPX discriminator output at MPX_SAMPLE_RATE (for stereo decode).
     pub fn process_mpx(&mut self, iq: &[u8]) -> Vec<f32> {
         let lowpassed = self.downsample_complex(iq);
         let demodulated = self.fm_demod(lowpassed);
@@ -212,16 +265,34 @@ mod tests {
 
     #[test]
     fn optimal_settings_matches_simple_fm() {
-        let (radio, demod) = optimal_settings(94_900_000, 192_000);
-        assert_eq!(demod.downsample, 6);
-        assert_eq!(radio.capture_rate, 1_152_000);
-        assert_eq!(radio.capture_freq, 94_900_000 + 1_152_000 / 4);
-    }
-
-    #[test]
-    fn optimal_settings_170k_legacy() {
         let (radio, demod) = optimal_settings(94_900_000, 170_000);
         assert_eq!(demod.downsample, 6);
         assert_eq!(radio.capture_rate, 1_020_000);
+        assert_eq!(radio.capture_freq, 94_900_000 + 1_020_000 / 4);
+    }
+
+    #[test]
+    fn optimal_settings_192k() {
+        let (radio, demod) = optimal_settings(94_900_000, 192_000);
+        assert_eq!(demod.downsample, 6);
+        assert_eq!(radio.capture_rate, 1_152_000);
+    }
+
+    #[test]
+    fn stereo_decimator_reduces_rate() {
+        let config = DemodConfig {
+            downsample: 6,
+            rate_out: 170_000,
+            rate_resample: 48_000,
+        };
+        let mut dec = StereoAudioDecimator::new(&config);
+        let n = 17_000usize;
+        let left: Vec<f32> = (0..n).map(|i| (i as f32 * 0.001).sin()).collect();
+        let right = left.clone();
+        let (out_l, out_r) = dec.process(&left, &right);
+        let expected = n * 48_000 / 170_000;
+        assert!(out_l.len() >= expected.saturating_sub(2));
+        assert!(out_l.len() <= expected + 2);
+        assert_eq!(out_l.len(), out_r.len());
     }
 }
