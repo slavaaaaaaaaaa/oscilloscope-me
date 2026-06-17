@@ -16,6 +16,8 @@ enum SdrCommand {
     SetFreq(u32),
     SetGain(i32),
     SetMono(bool),
+    SetPpm(i32),
+    SetDeemphasis(u8),
 }
 
 pub struct SdrHandle {
@@ -35,6 +37,14 @@ impl SdrHandle {
 
     pub fn set_mono(&self, mono: bool) {
         let _ = self.cmd_tx.send(SdrCommand::SetMono(mono));
+    }
+
+    pub fn set_ppm(&self, ppm: i32) {
+        let _ = self.cmd_tx.send(SdrCommand::SetPpm(ppm));
+    }
+
+    pub fn set_deemphasis(&self, us: u8) {
+        let _ = self.cmd_tx.send(SdrCommand::SetDeemphasis(us));
     }
 
     pub fn stop(mut self) {
@@ -89,6 +99,7 @@ pub fn start_capture(
     ppm: i32,
     gain_db: i32,
     mono_only: bool,
+    deemphasis_us: u8,
     device_rate: u32,
     ring: SharedRing,
     event_tx: crossbeam_channel::Sender<AppEvent>,
@@ -106,6 +117,7 @@ pub fn start_capture(
                 ppm,
                 gain_db,
                 mono_only,
+                deemphasis_us,
                 device_rate,
                 ring,
                 event_tx,
@@ -125,9 +137,10 @@ pub fn start_capture(
 
 fn capture_loop(
     freq_hz: u32,
-    ppm: i32,
+    mut ppm: i32,
     gain_db: i32,
     mut mono_only: bool,
+    mut deemphasis_us: u8,
     device_rate: u32,
     ring: SharedRing,
     event_tx: crossbeam_channel::Sender<AppEvent>,
@@ -174,7 +187,7 @@ fn capture_loop(
             gain_tenths: gain_db,
         });
 
-        let mut demod = DemodPipeline::new(demod_config, mono_only);
+        let mut demod = DemodPipeline::new(demod_config, mono_only, deemphasis_us);
         let mut buf = vec![0u8; DEFAULT_BUF_LENGTH];
 
         while !stop.load(Ordering::Relaxed) && !app_shutdown.load(Ordering::Relaxed) {
@@ -186,7 +199,7 @@ fn capture_loop(
                         demod_config = fresh;
                         if sdr.set_center_freq(radio.capture_freq).is_ok() {
                             let _ = sdr.reset_buffer();
-                            demod = DemodPipeline::new(demod_config, mono_only);
+                            demod = DemodPipeline::new(demod_config, mono_only, deemphasis_us);
                             if let Ok(mut r) = ring.lock() {
                                 r.clear();
                             }
@@ -201,7 +214,7 @@ fn capture_loop(
                         let (radio, fresh) = optimal_settings(freq_hz, MPX_SAMPLE_RATE);
                         demod_config = fresh;
                         if configure_sdr(&mut sdr, &radio, gain_db).is_ok() {
-                            demod = DemodPipeline::new(demod_config, mono_only);
+                            demod = DemodPipeline::new(demod_config, mono_only, deemphasis_us);
                             if let Ok(mut r) = ring.lock() {
                                 r.clear();
                             }
@@ -213,8 +226,19 @@ fn capture_loop(
                     }
                     SdrCommand::SetMono(mono) => {
                         mono_only = mono;
-                        demod = DemodPipeline::new(demod_config, mono_only);
+                        demod = DemodPipeline::new(demod_config, mono_only, deemphasis_us);
                         resampler.reset(AUDIO_SAMPLE_RATE, device_rate);
+                        if let Ok(mut r) = ring.lock() {
+                            r.clear();
+                        }
+                    }
+                    SdrCommand::SetPpm(new_ppm) => {
+                        ppm = new_ppm;
+                        let _ = sdr.set_freq_correction(ppm);
+                    }
+                    SdrCommand::SetDeemphasis(us) => {
+                        deemphasis_us = us;
+                        demod.set_deemphasis(deemphasis_us);
                         if let Ok(mut r) = ring.lock() {
                             r.clear();
                         }

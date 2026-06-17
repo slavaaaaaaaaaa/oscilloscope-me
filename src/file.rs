@@ -119,6 +119,9 @@ pub fn decode_mp3(path: &Path) -> Result<DecodedTrack, String> {
 
 enum FileCommand {
     SetLoop(bool),
+    SetPaused(bool),
+    SeekSeconds(f64),
+    Restart,
 }
 
 pub struct FileHandle {
@@ -130,6 +133,18 @@ pub struct FileHandle {
 impl FileHandle {
     pub fn set_loop(&self, loop_playback: bool) {
         let _ = self.cmd_tx.send(FileCommand::SetLoop(loop_playback));
+    }
+
+    pub fn set_paused(&self, paused: bool) {
+        let _ = self.cmd_tx.send(FileCommand::SetPaused(paused));
+    }
+
+    pub fn seek_seconds(&self, delta: f64) {
+        let _ = self.cmd_tx.send(FileCommand::SeekSeconds(delta));
+    }
+
+    pub fn restart(&self) {
+        let _ = self.cmd_tx.send(FileCommand::Restart);
     }
 
     pub fn stop(mut self) {
@@ -205,12 +220,43 @@ fn playback_loop(
 
     let mut pos = 0usize;
     let total = left.len();
+    let mut paused = false;
 
     while !stop.load(Ordering::Relaxed) && !app_shutdown.load(Ordering::Relaxed) {
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 FileCommand::SetLoop(v) => loop_playback = v,
+                FileCommand::SetPaused(v) => paused = v,
+                FileCommand::SeekSeconds(delta) => {
+                    let current = pos as f64 / source_rate as f64;
+                    let dur = total as f64 / source_rate as f64;
+                    let new_pos = if loop_playback {
+                        (current + delta).rem_euclid(dur.max(1e-9))
+                    } else {
+                        (current + delta).clamp(0.0, dur)
+                    };
+                    pos = (new_pos * source_rate as f64).round() as usize;
+                    pos = pos.min(total.saturating_sub(1));
+                    resampler.reset(source_rate, device_rate);
+                    if let Ok(mut r) = ring.lock() {
+                        r.clear();
+                    }
+                    paused = false;
+                }
+                FileCommand::Restart => {
+                    pos = 0;
+                    resampler.reset(source_rate, device_rate);
+                    if let Ok(mut r) = ring.lock() {
+                        r.clear();
+                    }
+                    paused = false;
+                }
             }
+        }
+
+        if paused {
+            thread::sleep(Duration::from_millis(16));
+            continue;
         }
 
         let end = (pos + CHUNK_FRAMES).min(total);
@@ -243,6 +289,31 @@ fn playback_loop(
             while let Ok(cmd) = cmd_rx.try_recv() {
                 match cmd {
                     FileCommand::SetLoop(v) => loop_playback = v,
+                    FileCommand::SetPaused(v) => paused = v,
+                    FileCommand::SeekSeconds(delta) => {
+                        let current = pos as f64 / source_rate as f64;
+                        let dur = total as f64 / source_rate as f64;
+                        let new_pos = if loop_playback {
+                            (current + delta).rem_euclid(dur.max(1e-9))
+                        } else {
+                            (current + delta).clamp(0.0, dur)
+                        };
+                        pos = (new_pos * source_rate as f64).round() as usize;
+                        pos = pos.min(total.saturating_sub(1));
+                        resampler.reset(source_rate, device_rate);
+                        if let Ok(mut r) = ring.lock() {
+                            r.clear();
+                        }
+                        paused = false;
+                    }
+                    FileCommand::Restart => {
+                        pos = 0;
+                        resampler.reset(source_rate, device_rate);
+                        if let Ok(mut r) = ring.lock() {
+                            r.clear();
+                        }
+                        paused = false;
+                    }
                 }
             }
             thread::sleep(Duration::from_millis(1));

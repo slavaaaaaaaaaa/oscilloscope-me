@@ -35,12 +35,21 @@ pub enum InputSource {
     File,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromptKind {
+    Freq,
+    Gain,
+    Ppm,
+}
+
 pub struct AppState {
     pub input_source: InputSource,
     pub file_path: String,
     pub file_loop: bool,
+    pub file_paused: bool,
     pub freq_hz: u32,
     pub ppm: i32,
+    pub deemphasis_us: u8,
     pub sdr_connected: bool,
     pub peak_l: f32,
     pub peak_r: f32,
@@ -51,6 +60,11 @@ pub struct AppState {
     pub gain_index: usize,
     pub gain_tenths: i32,
     pub mono_only: bool,
+    pub volume: f32,
+    pub muted: bool,
+    pub show_help: bool,
+    pub prompt: Option<PromptKind>,
+    pub prompt_buf: String,
 }
 
 impl AppState {
@@ -59,8 +73,10 @@ impl AppState {
             input_source: InputSource::Sdr,
             file_path: String::new(),
             file_loop: true,
+            file_paused: false,
             freq_hz,
             ppm,
+            deemphasis_us: 75,
             sdr_connected: false,
             peak_l: -120.0,
             peak_r: -120.0,
@@ -71,6 +87,11 @@ impl AppState {
             gain_index: 0,
             gain_tenths: -1,
             mono_only: false,
+            volume: 1.0,
+            muted: false,
+            show_help: false,
+            prompt: None,
+            prompt_buf: String::new(),
         }
     }
 
@@ -81,6 +102,22 @@ impl AppState {
         } else {
             format!("{:.1} dB", target as f64 / 10.0)
         }
+    }
+
+    pub fn deemphasis_label(&self) -> String {
+        match self.deemphasis_us {
+            50 => "50".to_string(),
+            0 => "off".to_string(),
+            _ => "75".to_string(),
+        }
+    }
+
+    pub fn cycle_deemphasis(&mut self) {
+        self.deemphasis_us = match self.deemphasis_us {
+            75 => 50,
+            50 => 0,
+            _ => 75,
+        };
     }
 }
 

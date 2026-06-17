@@ -118,7 +118,11 @@ pub fn draw(frame: &mut Frame, state: &AppState, display_buf: &[StereoSample], p
         .split(frame.area());
 
     draw_status(frame, chunks[0], state);
-    draw_vectorscope(frame, chunks[1], display_buf, phosphor);
+    if state.show_help {
+        draw_help_overlay(frame, chunks[1], state);
+    } else {
+        draw_vectorscope(frame, chunks[1], display_buf, phosphor);
+    }
     draw_help(frame, chunks[2], state);
 }
 
@@ -182,8 +186,11 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
         InputSource::File => {
             let file = truncate_path(&state.file_path);
             let loop_label = if state.file_loop { "loop" } else { "once" };
+            let pause = if state.file_paused { " | PAUSED" } else { "" };
             format!(
-                " FILE {file} | {loop_label} | {device} @ {} | L {} dBFS | R {} dBFS{status}",
+                " FILE {file} | {loop_label}{pause} | vol {:.2}{} | {device} @ {} | L {} dBFS | R {} dBFS{status}",
+                state.volume,
+                if state.muted { " MUTED" } else { "" },
                 format_audio_rate(state.audio_rate, state.requested_rate),
                 format_peak_db(state.peak_l),
                 format_peak_db(state.peak_r),
@@ -198,13 +205,16 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
                 "SDR --"
             };
             let gain = state.gain_label();
+            let deemph = state.deemphasis_label();
             let ppm = if state.ppm != 0 {
                 format!(" | ppm {}", state.ppm)
             } else {
                 String::new()
             };
             format!(
-                " {freq_mhz:.1} MHz | {sdr} | {mode} | gain {gain}{ppm} | {device} @ {} | L {} dBFS | R {} dBFS{status}",
+                " {freq_mhz:.1} MHz | {sdr} | {mode} | gain {gain} | de-emph {deemph}{ppm} | vol {:.2}{} | {device} @ {} | L {} dBFS | R {} dBFS{status}",
+                state.volume,
+                if state.muted { " MUTED" } else { "" },
                 format_audio_rate(state.audio_rate, state.requested_rate),
                 format_peak_db(state.peak_l),
                 format_peak_db(state.peak_r),
@@ -264,11 +274,65 @@ fn draw_vectorscope(frame: &mut Frame, area: Rect, samples: &[StereoSample], pho
 }
 
 fn draw_help(frame: &mut Frame, area: Rect, state: &AppState) {
-    let text = match state.input_source {
-        InputSource::File => " q quit | l loop on/off ",
-        InputSource::Sdr => " q quit | + / - tune | g gain | m mono/stereo ",
+    let text = if state.show_help {
+        " (? or h to return) "
+    } else if state.prompt.is_some() {
+        " Enter confirm | Esc cancel "
+    } else {
+        match state.input_source {
+            InputSource::File => " q quit | space pause | ←/→ seek | r restart | l loop | ? help ",
+            InputSource::Sdr => " q quit | ↑↓ tune | ←→ coarse | g gain | m mono | d de-emph | space mute | ? help ",
+        }
     };
     let para = Paragraph::new(text);
+    frame.render_widget(para, area);
+}
+
+fn draw_help_overlay(frame: &mut Frame, area: Rect, state: &AppState) {
+    let common = [
+        "  + / =      volume up",
+        "  -          volume down",
+        "  ? or h     toggle this help",
+        "  q          quit",
+    ];
+    let mode: &[&str] = match state.input_source {
+        InputSource::Sdr => &[
+            "  up / .     tune +0.1 MHz       down / ,   tune -0.1 MHz",
+            "  right / >  tune +1.0 MHz       left / <   tune -1.0 MHz",
+            "  f          type a frequency    g          set gain (dB or auto)",
+            "  p          set ppm             m          mono / stereo",
+            "  d          de-emphasis 75/50/off",
+            "  space      mute                o          play a file instead",
+        ],
+        InputSource::File => &[
+            "  space      pause / resume      r          restart from start",
+            "  ← / >      seek −10 s / +10 s",
+            "  l          loop on / off       o          open another file",
+            "  f          switch to SDR tuning",
+        ],
+    };
+    let source = match state.input_source {
+        InputSource::Sdr => "SDR",
+        InputSource::File => "FILE",
+    };
+    let mut lines: Vec<String> = vec![
+        String::new(),
+        "  oscilloscope-me — controls".into(),
+        String::new(),
+        format!("  current source: {source}"),
+        String::new(),
+    ];
+    lines.extend(mode.iter().map(|s| s.to_string()));
+    lines.push(String::new());
+    lines.push("  any mode:".into());
+    lines.extend(common.iter().map(|s| s.to_string()));
+    lines.push(String::new());
+    lines.push("  (press ? or h to return)".into());
+    let text = lines.join("\n");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" help ");
+    let para = Paragraph::new(text).block(block);
     frame.render_widget(para, area);
 }
 

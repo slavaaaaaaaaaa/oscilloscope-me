@@ -1,15 +1,21 @@
 mod app;
 mod audio;
+mod controls;
 mod demod;
 mod display;
 mod file;
 mod sdr;
 
-use app::{AppEvent, AppState, GAIN_STEPS, ShutdownFlag, StereoSample};
+use app::{AppEvent, AppState, GAIN_STEPS, PromptKind, ShutdownFlag, StereoSample};
+use audio::AudioControls;
+use controls::{
+    is_volume_down, is_volume_up, RepeatFilter, FILE_SEEK_SECS, TUNE_COARSE_MHZ, TUNE_STEP_MHZ,
+    VOLUME_MAX, VOLUME_STEP,
+};
 use cpal::traits::{DeviceTrait, HostTrait};
 use crate::demod::AUDIO_SAMPLE_RATE;
 use clap::Parser;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
@@ -86,6 +92,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let ring = sdr::new_shared_ring();
     let shutdown = ShutdownFlag::new();
+    let audio_controls = AudioControls::new();
 
     let input_rate = AUDIO_SAMPLE_RATE;
 
@@ -93,6 +100,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli.audio_device.as_deref(),
         cli.rate,
         ring.clone(),
+        audio_controls.clone(),
     )?;
     state.audio_device = audio.device_name.clone();
     state.audio_rate = audio.sample_rate;
@@ -120,6 +128,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cli.ppm,
             GAIN_STEPS[state.gain_index],
             state.mono_only,
+            state.deemphasis_us,
             audio.sample_rate,
             ring.clone(),
             event_tx.clone(),
@@ -173,6 +182,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_tick = Instant::now();
     let mut display_buf: Vec<StereoSample> = Vec::with_capacity(display::TRACE_CAPACITY);
     let mut phosphor = display::Phosphor::new();
+    let mut vol_filter = RepeatFilter::new();
 
     loop {
         if shutdown.is_set() {
@@ -244,22 +254,121 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
+                if state.prompt.is_some() {
+                    handle_prompt_key(
+                        &key,
+                        &mut state,
+                        &mut sdr_handle,
+                        &mut display_buf,
+                        &mut phosphor,
+                    );
+                    continue;
+                }
+                if state.show_help
+                    && matches!(key.code, KeyCode::Char('h') | KeyCode::Char('?'))
+                {
+                    state.show_help = false;
+                    continue;
+                }
+                let vol_key = match key.code {
+                    KeyCode::Char(c) if is_volume_up(c) || is_volume_down(c) => {
+                        Some(c)
+                    }
+                    KeyCode::Char('-') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        Some('_')
+                    }
+                    _ => None,
+                };
+                if let Some(c) = vol_filter.filter(vol_key, Instant::now()) {
+                    adjust_volume(&mut state, &audio_controls, c);
+                    continue;
+                }
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => shutdown.set(),
-                    KeyCode::Char('+') | KeyCode::Char('=') if sdr_handle.is_some() => {
-                        state.freq_hz = state.freq_hz.saturating_add(100_000);
-                        tune_sdr(&mut sdr_handle, &mut state, &mut display_buf, &mut phosphor);
+                    KeyCode::Char('h') | KeyCode::Char('?') => {
+                        state.show_help = !state.show_help;
                     }
-                    KeyCode::Char('-') if sdr_handle.is_some() => {
-                        state.freq_hz = state.freq_hz.saturating_sub(100_000);
-                        tune_sdr(&mut sdr_handle, &mut state, &mut display_buf, &mut phosphor);
+                    KeyCode::Char(' ') => {
+                        if sdr_handle.is_some() {
+                            state.muted = !state.muted;
+                            audio_controls.set_muted(state.muted);
+                            state.status_message = if state.muted {
+                                "muted".into()
+                            } else {
+                                "unmuted".into()
+                            };
+                        } else if file_handle.is_some() {
+                            state.file_paused = !state.file_paused;
+                            if let Some(h) = file_handle.as_ref() {
+                                h.set_paused(state.file_paused);
+                            }
+                            state.status_message = if state.file_paused {
+                                "paused".into()
+                            } else {
+                                "playing".into()
+                            };
+                        }
+                    }
+                    KeyCode::Up | KeyCode::Char('.') if sdr_handle.is_some() => {
+                        tune_mhz(
+                            TUNE_STEP_MHZ,
+                            &mut sdr_handle,
+                            &mut state,
+                            &mut display_buf,
+                            &mut phosphor,
+                        );
+                    }
+                    KeyCode::Down | KeyCode::Char(',') if sdr_handle.is_some() => {
+                        tune_mhz(
+                            -TUNE_STEP_MHZ,
+                            &mut sdr_handle,
+                            &mut state,
+                            &mut display_buf,
+                            &mut phosphor,
+                        );
+                    }
+                    KeyCode::Right | KeyCode::Char('>') if sdr_handle.is_some() => {
+                        tune_mhz(
+                            TUNE_COARSE_MHZ,
+                            &mut sdr_handle,
+                            &mut state,
+                            &mut display_buf,
+                            &mut phosphor,
+                        );
+                    }
+                    KeyCode::Left | KeyCode::Char('<') if sdr_handle.is_some() => {
+                        tune_mhz(
+                            -TUNE_COARSE_MHZ,
+                            &mut sdr_handle,
+                            &mut state,
+                            &mut display_buf,
+                            &mut phosphor,
+                        );
+                    }
+                    KeyCode::Left | KeyCode::Char('<') if file_handle.is_some() => {
+                        if let Some(h) = file_handle.as_ref() {
+                            h.seek_seconds(-FILE_SEEK_SECS);
+                        }
+                        state.file_paused = false;
+                        state.status_message = format!("seek -{FILE_SEEK_SECS:.0}s");
+                    }
+                    KeyCode::Right | KeyCode::Char('>') if file_handle.is_some() => {
+                        if let Some(h) = file_handle.as_ref() {
+                            h.seek_seconds(FILE_SEEK_SECS);
+                        }
+                        state.file_paused = false;
+                        state.status_message = format!("seek +{FILE_SEEK_SECS:.0}s");
                     }
                     KeyCode::Char('g') if sdr_handle.is_some() => {
-                        state.gain_index = (state.gain_index + 1) % GAIN_STEPS.len();
-                        state.gain_tenths = GAIN_STEPS[state.gain_index];
-                        if let Some(h) = sdr_handle.as_ref() {
-                            h.set_gain(state.gain_tenths);
-                        }
+                        start_prompt(&mut state, PromptKind::Gain, "Gain dB or 'auto'");
+                    }
+                    KeyCode::Char('f') if sdr_handle.is_some() => {
+                        let label = format!("Frequency MHz [{:.1}]", mhz(state.freq_hz));
+                        start_prompt(&mut state, PromptKind::Freq, &label);
+                    }
+                    KeyCode::Char('p') if sdr_handle.is_some() => {
+                        let label = format!("ppm correction [{}]", state.ppm);
+                        start_prompt(&mut state, PromptKind::Ppm, &label);
                     }
                     KeyCode::Char('m') if sdr_handle.is_some() => {
                         state.mono_only = !state.mono_only;
@@ -267,12 +376,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(h) = sdr_handle.as_ref() {
                             h.set_mono(state.mono_only);
                         }
+                        state.status_message = if state.mono_only {
+                            "mono".into()
+                        } else {
+                            "stereo".into()
+                        };
+                    }
+                    KeyCode::Char('d') if sdr_handle.is_some() => {
+                        state.cycle_deemphasis();
+                        if let Some(h) = sdr_handle.as_ref() {
+                            h.set_deemphasis(state.deemphasis_us);
+                        }
+                        state.status_message = format!("de-emph {}", state.deemphasis_label());
                     }
                     KeyCode::Char('l') if file_handle.is_some() => {
                         state.file_loop = !state.file_loop;
                         if let Some(h) = file_handle.as_ref() {
                             h.set_loop(state.file_loop);
                         }
+                        state.status_message = if state.file_loop {
+                            "loop on".into()
+                        } else {
+                            "loop off".into()
+                        };
+                    }
+                    KeyCode::Char('r') if file_handle.is_some() => {
+                        if let Some(h) = file_handle.as_ref() {
+                            h.restart();
+                        }
+                        state.file_paused = false;
+                        state.status_message = "restarted".into();
+                    }
+                    KeyCode::Char('o') => {
+                        state.status_message =
+                            "use --file <path> or restart without --file to switch source".into();
+                    }
+                    KeyCode::Char('f') if file_handle.is_some() => {
+                        state.status_message =
+                            "use --file to switch sources; restart without --file for SDR".into();
                     }
                     _ => {}
                 }
@@ -287,6 +428,132 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         h.stop();
     }
     teardown_terminal(&mut terminal)?;
+    Ok(())
+}
+
+fn mhz(freq_hz: u32) -> f64 {
+    freq_hz as f64 / 1_000_000.0
+}
+
+fn adjust_volume(state: &mut AppState, controls: &AudioControls, key: char) {
+    if is_volume_up(key) {
+        state.volume = (state.volume + VOLUME_STEP).min(VOLUME_MAX);
+    } else if is_volume_down(key) {
+        state.volume = (state.volume - VOLUME_STEP).max(0.0);
+    }
+    controls.set_volume(state.volume);
+    state.status_message = format!("volume {:.2}", state.volume);
+}
+
+fn tune_mhz(
+    delta_mhz: f64,
+    handle: &mut Option<sdr::SdrHandle>,
+    state: &mut AppState,
+    display_buf: &mut Vec<StereoSample>,
+    phosphor: &mut display::Phosphor,
+) {
+    let delta_hz = (delta_mhz * 1_000_000.0).round() as i64;
+    state.freq_hz = ((state.freq_hz as i64) + delta_hz).max(0) as u32;
+    tune_sdr(handle, state, display_buf, phosphor);
+    state.status_message = format!("{:.1} MHz", mhz(state.freq_hz));
+}
+
+fn start_prompt(state: &mut AppState, kind: PromptKind, label: &str) {
+    state.prompt = Some(kind);
+    state.prompt_buf.clear();
+    state.status_message = format!("{label}: ");
+}
+
+fn handle_prompt_key(
+    key: &event::KeyEvent,
+    state: &mut AppState,
+    sdr_handle: &mut Option<sdr::SdrHandle>,
+    display_buf: &mut Vec<StereoSample>,
+    phosphor: &mut display::Phosphor,
+) {
+    match key.code {
+        KeyCode::Esc => {
+            state.prompt = None;
+            state.prompt_buf.clear();
+            state.status_message = "cancelled".into();
+        }
+        KeyCode::Enter => {
+            let kind = state.prompt.take().unwrap();
+            let input = state.prompt_buf.trim().to_string();
+            state.prompt_buf.clear();
+            if input.is_empty() {
+                state.status_message = "cancelled".into();
+                return;
+            }
+            match kind {
+                PromptKind::Freq => match input.parse::<f64>() {
+                    Ok(mhz) if mhz > 0.0 => {
+                        state.freq_hz = (mhz * 1_000_000.0).round() as u32;
+                        tune_sdr(sdr_handle, state, display_buf, phosphor);
+                        state.status_message = format!("{mhz:.1} MHz");
+                    }
+                    _ => state.status_message = "bad frequency".into(),
+                },
+                PromptKind::Gain => match apply_gain_input(state, &input) {
+                    Ok(()) => {
+                        if let Some(h) = sdr_handle.as_ref() {
+                            h.set_gain(state.gain_tenths);
+                        }
+                        state.status_message = format!("gain {}", state.gain_label());
+                    }
+                    Err(msg) => state.status_message = msg.into(),
+                },
+                PromptKind::Ppm => match input.parse::<i32>() {
+                    Ok(ppm) => {
+                        state.ppm = ppm;
+                        if let Some(h) = sdr_handle.as_ref() {
+                            h.set_ppm(ppm);
+                        }
+                        state.status_message = format!("ppm {ppm}");
+                    }
+                    Err(_) => state.status_message = "bad ppm".into(),
+                },
+            }
+        }
+        KeyCode::Backspace => {
+            state.prompt_buf.pop();
+            if let Some(kind) = state.prompt {
+                let label = match kind {
+                    PromptKind::Freq => format!("Frequency MHz [{:.1}]", mhz(state.freq_hz)),
+                    PromptKind::Gain => format!("Gain dB or 'auto' [{}]", state.gain_label()),
+                    PromptKind::Ppm => format!("ppm correction [{}]", state.ppm),
+                };
+                state.status_message = format!("{label}: {}", state.prompt_buf);
+            }
+        }
+        KeyCode::Char(c) => {
+            state.prompt_buf.push(c);
+            if let Some(kind) = state.prompt {
+                let label = match kind {
+                    PromptKind::Freq => format!("Frequency MHz [{:.1}]", mhz(state.freq_hz)),
+                    PromptKind::Gain => format!("Gain dB or 'auto' [{}]", state.gain_label()),
+                    PromptKind::Ppm => format!("ppm correction [{}]", state.ppm),
+                };
+                state.status_message = format!("{label}: {}", state.prompt_buf);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn apply_gain_input(state: &mut AppState, input: &str) -> Result<(), &'static str> {
+    let lower = input.trim().to_lowercase();
+    if lower == "auto" || lower == "a" {
+        state.gain_index = 0;
+        state.gain_tenths = GAIN_STEPS[0];
+        return Ok(());
+    }
+    let db: f64 = input.trim().parse().map_err(|_| "bad gain")?;
+    state.gain_tenths = (db * 10.0).round() as i32;
+    state.gain_index = GAIN_STEPS
+        .iter()
+        .position(|&g| g == state.gain_tenths)
+        .unwrap_or(1);
     Ok(())
 }
 

@@ -114,14 +114,30 @@ oscilloscope-me [OPTIONS]
 
 ### In-app keys
 
+Same bindings as [oscope-me](https://github.com/slava/oscope-me):
+
 | Key | Action |
 |-----|--------|
+| `+` / `=` / `-` | Volume up / down |
+| `?` or `h` | Toggle help overlay |
 | `q` / `Esc` | Quit |
-| `+` / `=` | Tune +0.1 MHz (SDR only) |
-| `-` | Tune −0.1 MHz (SDR only) |
-| `g` | Cycle gain (SDR only) |
-| `m` | Toggle mono / stereo decode (SDR only) |
-| `l` | Toggle loop (file mode only) |
+| **SDR mode** | |
+| `↑` / `↓` (or `.` / `,`) | Tune ∓0.1 MHz |
+| `→` / `←` (or `>` / `<`) | Tune ∓1.0 MHz |
+| `f` | Type in a frequency |
+| `g` | Set tuner gain (dB or `auto`) |
+| `p` | Set ppm correction |
+| `m` | Mono / stereo toggle |
+| `d` | Cycle de-emphasis 75 → 50 → off |
+| `space` | Mute / unmute |
+| `o` | Switch to file (restart with `--file`) |
+| **File mode** | |
+| `space` | Pause / resume |
+| `→` / `←` (or `>` / `<`) | Seek ∓10 s |
+| `r` | Restart from the beginning |
+| `l` | Loop on / off |
+| `o` | Open another file (restart with `--file`) |
+| `f` | Switch to SDR (restart without `--file`) |
 
 ## How it works
 

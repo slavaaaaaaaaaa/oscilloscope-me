@@ -8,27 +8,52 @@ pub use fm::{
 };
 pub use stereo::StereoDecoder;
 
+fn deemphasis_filters(us: u8, sample_rate: f64) -> (filters::Deemphasis, filters::Deemphasis, filters::Deemphasis) {
+    let mk = |us: u8| match us {
+        50 => filters::Deemphasis::eu_broadcast(sample_rate),
+        0 => filters::Deemphasis::disabled(),
+        _ => filters::Deemphasis::us_broadcast(sample_rate),
+    };
+    let mono = mk(us);
+    let l = mk(us);
+    let r = mk(us);
+    (mono, l, r)
+}
+
 pub struct DemodPipeline {
     fm: RtlFmReceiver,
     stereo: StereoDecoder,
     decimator: StereoAudioDecimator,
     mono_only: bool,
+    deemphasis_us: u8,
     mono_deemph: filters::Deemphasis,
     deemph_l: filters::Deemphasis,
     deemph_r: filters::Deemphasis,
 }
 
 impl DemodPipeline {
-    pub fn new(config: DemodConfig, mono_only: bool) -> Self {
+    pub fn new(config: DemodConfig, mono_only: bool, deemphasis_us: u8) -> Self {
+        let rate = AUDIO_SAMPLE_RATE as f64;
+        let (mono_deemph, deemph_l, deemph_r) = deemphasis_filters(deemphasis_us, rate);
         Self {
             fm: RtlFmReceiver::new(config),
             stereo: StereoDecoder::new(),
             decimator: StereoAudioDecimator::new(&config),
             mono_only,
-            mono_deemph: filters::Deemphasis::us_broadcast(AUDIO_SAMPLE_RATE as f64),
-            deemph_l: filters::Deemphasis::us_broadcast(AUDIO_SAMPLE_RATE as f64),
-            deemph_r: filters::Deemphasis::us_broadcast(AUDIO_SAMPLE_RATE as f64),
+            deemphasis_us,
+            mono_deemph,
+            deemph_l,
+            deemph_r,
         }
+    }
+
+    pub fn set_deemphasis(&mut self, deemphasis_us: u8) {
+        self.deemphasis_us = deemphasis_us;
+        let rate = AUDIO_SAMPLE_RATE as f64;
+        let (mono_deemph, deemph_l, deemph_r) = deemphasis_filters(deemphasis_us, rate);
+        self.mono_deemph = mono_deemph;
+        self.deemph_l = deemph_l;
+        self.deemph_r = deemph_r;
     }
 
     pub fn process_iq(&mut self, iq: &[u8]) -> StereoFrame {

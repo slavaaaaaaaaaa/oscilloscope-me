@@ -8,6 +8,39 @@ use cpal::{
 use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
 
 use crate::sdr::SharedRing;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
+
+#[derive(Clone)]
+pub struct AudioControls {
+    volume: Arc<AtomicU32>,
+    muted: Arc<AtomicBool>,
+}
+
+impl AudioControls {
+    pub fn new() -> Self {
+        Self {
+            volume: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            muted: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn volume(&self) -> f32 {
+        f32::from_bits(self.volume.load(Ordering::Relaxed))
+    }
+
+    pub fn set_volume(&self, v: f32) {
+        self.volume.store(v.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn is_muted(&self) -> bool {
+        self.muted.load(Ordering::Relaxed)
+    }
+
+    pub fn set_muted(&self, muted: bool) {
+        self.muted.store(muted, Ordering::Relaxed);
+    }
+}
 
 pub struct AudioOutput {
     _stream: Stream,
@@ -244,6 +277,7 @@ pub fn start_audio(
     device_filter: Option<&str>,
     target_rate: u32,
     ring: SharedRing,
+    controls: AudioControls,
 ) -> Result<AudioOutput, String> {
     let device = pick_output_device(device_filter)?;
     let device_name = device.name().unwrap_or_else(|_| "unknown".into());
@@ -268,15 +302,16 @@ pub fn start_audio(
     let channels = stream_config.channels as usize;
 
     let ring_cb = ring.clone();
+    let controls_cb = controls.clone();
 
     let stream = match sample_format {
-        SampleFormat::F32 => build_stream::<f32>(&device, &stream_config, ring_cb, channels)?,
-        SampleFormat::I16 => build_stream::<i16>(&device, &stream_config, ring_cb, channels)?,
-        SampleFormat::U16 => build_stream::<u16>(&device, &stream_config, ring_cb, channels)?,
-        SampleFormat::I32 => build_stream::<i32>(&device, &stream_config, ring_cb, channels)?,
-        SampleFormat::F64 => build_stream::<f64>(&device, &stream_config, ring_cb, channels)?,
-        SampleFormat::I8 => build_stream::<i8>(&device, &stream_config, ring_cb, channels)?,
-        SampleFormat::U8 => build_stream::<u8>(&device, &stream_config, ring_cb, channels)?,
+        SampleFormat::F32 => build_stream::<f32>(&device, &stream_config, ring_cb, controls_cb, channels)?,
+        SampleFormat::I16 => build_stream::<i16>(&device, &stream_config, ring_cb, controls_cb, channels)?,
+        SampleFormat::U16 => build_stream::<u16>(&device, &stream_config, ring_cb, controls_cb, channels)?,
+        SampleFormat::I32 => build_stream::<i32>(&device, &stream_config, ring_cb, controls_cb, channels)?,
+        SampleFormat::F64 => build_stream::<f64>(&device, &stream_config, ring_cb, controls_cb, channels)?,
+        SampleFormat::I8 => build_stream::<i8>(&device, &stream_config, ring_cb, controls_cb, channels)?,
+        SampleFormat::U8 => build_stream::<u8>(&device, &stream_config, ring_cb, controls_cb, channels)?,
         other => {
             return Err(format!(
                 "Unsupported sample format: {other:?}. Try -a <device>."
@@ -299,6 +334,7 @@ fn build_stream<T>(
     device: &cpal::Device,
     config: &StreamConfig,
     ring: SharedRing,
+    controls: AudioControls,
     channels: usize,
 ) -> Result<Stream, String>
 where
@@ -324,6 +360,9 @@ where
                     ring.read_interleaved(&mut scratch[..stereo_needed])
                 };
 
+                let vol = controls.volume();
+                let muted = controls.is_muted();
+
                 for frame in 0..frames {
                     let l = if frame < got {
                         scratch[frame * 2]
@@ -343,18 +382,22 @@ where
 
                 for (i, sample) in out.iter_mut().enumerate() {
                     let ch = i % channels;
-                    let src = if ch == 0 {
-                        if i / channels < got {
+                    let src = if muted {
+                        0.0
+                    } else if ch == 0 {
+                        let raw = if i / channels < got {
                             scratch[(i / channels) * 2]
                         } else {
                             hold_l
-                        }
+                        };
+                        raw * vol
                     } else if ch == 1 {
-                        if i / channels < got {
+                        let raw = if i / channels < got {
                             scratch[(i / channels) * 2 + 1]
                         } else {
                             hold_r
-                        }
+                        };
+                        raw * vol
                     } else {
                         0.0
                     };

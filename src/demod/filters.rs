@@ -68,6 +68,15 @@ impl Deemphasis {
         Self::new(sample_rate, 75e-6)
     }
 
+    pub fn eu_broadcast(sample_rate: f64) -> Self {
+        Self::new(sample_rate, 50e-6)
+    }
+
+    /// Pass-through (de-emphasis off).
+    pub fn disabled() -> Self {
+        Self { alpha: 1.0, state: 0.0 }
+    }
+
     pub fn process(&mut self, x: f64) -> f64 {
         self.state += self.alpha * (x - self.state);
         self.state
