@@ -3,8 +3,8 @@ mod fm;
 mod stereo;
 
 pub use fm::{
-    configure_sdr, optimal_settings, DemodConfig, MPX_SAMPLE_RATE, RtlFmReceiver,
-    StereoAudioDecimator, AUDIO_SAMPLE_RATE,
+    centered_iq_settings_with_rates, configure_sdr, optimal_settings, DemodConfig, MPX_SAMPLE_RATE,
+    RadioConfig, RtlFmReceiver, StereoAudioDecimator, AUDIO_SAMPLE_RATE,
 };
 pub use stereo::StereoDecoder;
 
@@ -37,7 +37,7 @@ impl DemodPipeline {
         let (mono_deemph, deemph_l, deemph_r) = deemphasis_filters(deemphasis_us, rate);
         Self {
             fm: RtlFmReceiver::new(config),
-            stereo: StereoDecoder::new(),
+            stereo: StereoDecoder::new(config.rate_out as f64),
             decimator: StereoAudioDecimator::new(&config),
             mono_only,
             deemphasis_us,

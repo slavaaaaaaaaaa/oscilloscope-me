@@ -17,6 +17,8 @@ pub struct DemodConfig {
     pub downsample: u32,
     pub rate_out: u32,
     pub rate_resample: u32,
+    /// RTL dongles need `rotate_90` on their offset IQ; native I/Q sources do not.
+    pub rtl_rotate: bool,
 }
 
 pub fn optimal_settings(freq_hz: u32, mpx_rate: u32) -> (RadioConfig, DemodConfig) {
@@ -32,6 +34,53 @@ pub fn optimal_settings(freq_hz: u32, mpx_rate: u32) -> (RadioConfig, DemodConfi
             downsample,
             rate_out: mpx_rate,
             rate_resample: AUDIO_SAMPLE_RATE,
+            rtl_rotate: true,
+        },
+    )
+}
+
+/// FM settings for devices that output (or convert to) centered complex I/Q at `freq_hz`.
+pub fn centered_iq_settings(freq_hz: u32, mpx_rate: u32) -> (RadioConfig, DemodConfig) {
+    let (mut radio, mut demod) = optimal_settings(freq_hz, mpx_rate);
+    radio.capture_freq = freq_hz;
+    demod.rtl_rotate = false;
+    (radio, demod)
+}
+
+/// Like [`centered_iq_settings`] but picks capture rate / downsample from hardware-supported IQ rates.
+pub fn centered_iq_settings_with_rates(
+    freq_hz: u32,
+    mpx_rate: u32,
+    supported: &[u32],
+) -> (RadioConfig, DemodConfig) {
+    if supported.is_empty() {
+        return centered_iq_settings(freq_hz, mpx_rate);
+    }
+    let mut best_rate = supported[0];
+    let mut best_ds = 1u32;
+    let mut best_err = u32::MAX;
+    for &rate in supported {
+        for ds in 1..=32u32 {
+            let out = rate / ds;
+            let err = out.abs_diff(mpx_rate);
+            if err < best_err {
+                best_err = err;
+                best_rate = rate;
+                best_ds = ds;
+            }
+        }
+    }
+    let rate_out = best_rate / best_ds;
+    (
+        RadioConfig {
+            capture_freq: freq_hz,
+            capture_rate: best_rate,
+        },
+        DemodConfig {
+            downsample: best_ds,
+            rate_out,
+            rate_resample: AUDIO_SAMPLE_RATE,
+            rtl_rotate: false,
         },
     )
 }
@@ -142,7 +191,9 @@ impl RtlFmReceiver {
 
     fn downsample_complex(&mut self, iq: &[u8]) -> Vec<Complex<i32>> {
         let mut buf = iq.to_vec();
-        rotate_90(&mut buf);
+        if self.config.rtl_rotate {
+            rotate_90(&mut buf);
+        }
         let signed: Vec<i16> = buf.iter().map(|&v| v as i16 - 127).collect();
         let complex = bytes_to_complex(&signed);
         self.low_pass_complex(complex)
@@ -259,6 +310,15 @@ mod tests {
         assert_eq!(demod.downsample, 6);
         assert_eq!(radio.capture_rate, 1_020_000);
         assert_eq!(radio.capture_freq, 94_900_000 + 1_020_000 / 4);
+        assert!(demod.rtl_rotate);
+    }
+
+    #[test]
+    fn centered_iq_settings_tune_station_directly() {
+        let (radio, demod) = centered_iq_settings(94_900_000, 170_000);
+        assert_eq!(radio.capture_freq, 94_900_000);
+        assert_eq!(radio.capture_rate, 1_020_000);
+        assert!(!demod.rtl_rotate);
     }
 
     #[test]
@@ -274,6 +334,7 @@ mod tests {
             downsample: 6,
             rate_out: 170_000,
             rate_resample: 48_000,
+            rtl_rotate: true,
         };
         let mut dec = StereoAudioDecimator::new(&config);
         let n = 17_000usize;

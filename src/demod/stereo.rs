@@ -1,7 +1,6 @@
 //! FM stereo MPX decoder: 19 kHz pilot PLL, L+R / L-R separation.
 
 use super::filters::Biquad;
-use super::fm::MPX_SAMPLE_RATE;
 
 const PILOT_HZ: f64 = 19_000.0;
 const PLL_BW_HZ: f64 = 50.0;
@@ -26,8 +25,7 @@ pub struct StereoDecoder {
 }
 
 impl StereoDecoder {
-    pub fn new() -> Self {
-        let sample_rate = MPX_SAMPLE_RATE as f64;
+    pub fn new(sample_rate: f64) -> Self {
         let pilot_norm = PILOT_HZ / sample_rate;
         let bw_norm = PLL_BW_HZ / sample_rate;
         let bw = bw_norm * 2.0 * std::f64::consts::PI;
@@ -74,7 +72,8 @@ impl StereoDecoder {
 
             let lmr = match self.use_cos_carrier {
                 Some(true) => lmr_cos,
-                _ => lmr_sin,
+                Some(false) => lmr_sin,
+                None => 0.0,
             };
 
             left.push(((lpr + lmr) * 0.5) as f32);
@@ -117,6 +116,7 @@ impl StereoDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::fm::MPX_SAMPLE_RATE;
 
     fn synth_mpx(
         sample_rate: f64,
@@ -154,11 +154,23 @@ mod tests {
     }
 
     #[test]
+    fn mono_until_pilot_lock() {
+        let sr = MPX_SAMPLE_RATE as f64;
+        let n = 100;
+        let mpx: Vec<f32> = (0..n).map(|_| 0.5).collect();
+        let mut decoder = StereoDecoder::new(sr);
+        let (left, right) = decoder.process_mpx(&mpx);
+        for (&l, &r) in left.iter().zip(right.iter()) {
+            assert!((l - r).abs() < 1e-6, "L/R should match before pilot lock");
+        }
+    }
+
+    #[test]
     fn stereo_decoder_sin_subcarrier() {
         let sr = MPX_SAMPLE_RATE as f64;
         let n = 80_000;
         let mpx = synth_mpx(sr, n, |wt| wt.sin());
-        let mut decoder = StereoDecoder::new();
+        let mut decoder = StereoDecoder::new(sr);
         let (left, right) = decoder.process_mpx(&mpx);
         assert_separated(&left[n / 2..], &right[n / 2..]);
     }
@@ -168,7 +180,7 @@ mod tests {
         let sr = MPX_SAMPLE_RATE as f64;
         let n = 80_000;
         let mpx = synth_mpx(sr, n, |wt| wt.cos());
-        let mut decoder = StereoDecoder::new();
+        let mut decoder = StereoDecoder::new(sr);
         let (left, right) = decoder.process_mpx(&mpx);
         assert_separated(&left[n / 2..], &right[n / 2..]);
     }

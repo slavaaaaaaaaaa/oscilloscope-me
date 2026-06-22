@@ -1,12 +1,16 @@
-# oscilloscope-me
+# oscilloscope-me (**INACTIVE**)
 
 FM SDR receiver with a terminal **X/Y vectorscope** for [oscilloscope music](https://oscilloscopemusic.com/). Tune an FM station (e.g. ToorCamp's LOL radio), preview Lissajous shapes in the terminal, and output stereo L/R audio for an analog oscilloscope in XY mode.
 
 ![Terminal vectorscope](screenshot.png)
 
+## Status
+
+**INACTIVE**: Cursor _hates_ working on this project, continuously adding regressions, ineffectively implementing bugfixes, etc. Use [`oscope-me`](https://github.com/slavaaaaaaaaaa/oscope-me) instead.
+
 ## Hardware
 
-- **SDR:** RTL-SDR compatible dongle (tested target: NooElec NESDR Smart v5 — RTL2832U + R820T2/R860)
+- **SDR:** RTL-SDR compatible dongle (tested target: NooElec NESDR Smart v5 — RTL2832U + R820T2/R860), Airspy R2 / Mini (pure-Rust [rs-spy](https://crates.io/crates/rs-spy)), or Airspy HF+ / HF+ Discovery ([libairspyhf](https://github.com/airspy/airspyhf))
 - **Antenna:** FM band antenna
 - **Optional:** Analog oscilloscope in XY mode, shielded stereo audio cable (192 kHz capable)
 - **Note:** Laptop headphone jacks are AC-coupled; images may drift on an analog scope. A DC-coupled USB DAC gives better results.
@@ -22,7 +26,7 @@ FM SDR receiver with a terminal **X/Y vectorscope** for [oscilloscope music](htt
 ### macOS (Apple Silicon)
 
 ```bash
-brew install libusb pkg-config
+brew install libusb pkg-config airspyhf
 cargo build --release
 ```
 
@@ -30,7 +34,7 @@ cargo build --release
 
 ```bash
 # Debian/Ubuntu
-sudo apt install libusb-1.0-0-dev pkg-config libasound2-dev cargo
+sudo apt install libusb-1.0-0-dev pkg-config libasound2-dev libairspyhf-dev cargo
 
 # Fedora
 sudo dnf install libusb1-devel pkg-config libasound2-dev cargo
@@ -75,7 +79,7 @@ Stereo / scope mode:
 cargo run --release -- -f 92.5
 ```
 
-1. Plug in the SDR — the app waits until one is detected
+1. Plug in an RTL-SDR, Airspy R2/Mini, or Airspy HF+ — the app waits until one is detected (RTL-SDR is preferred if several are connected)
 2. Tunes **92.5 MHz** by default (override with `-f`)
 3. Terminal shows a live X/Y vectorscope; audio plays on the default output device
 
